@@ -13,6 +13,7 @@ export async function POST(request: Request) {
     goLive?: unknown;
     stopLive?: unknown;
     test?: unknown;
+    orient?: unknown;
   };
   try {
     body = await request.json();
@@ -26,11 +27,13 @@ export async function POST(request: Request) {
   if (body.goLive === true) next.liveUntil = Date.now() + LIVE_WINDOW_MS;
   if (body.stopLive === true) next.liveUntil = 0;
   if (body.test === true) next.testAt = Date.now();
+  if (body.orient === 0 || body.orient === 180) next.orient = body.orient;
 
   if (
     next.arm !== flags.arm ||
     next.liveUntil !== flags.liveUntil ||
-    next.testAt !== flags.testAt
+    next.testAt !== flags.testAt ||
+    next.orient !== flags.orient
   ) {
     await writeFlags(next);
   }

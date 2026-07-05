@@ -224,6 +224,8 @@ export default function Viewer() {
   const [flash, setFlash] = useState("");
   const [busy, setBusy] = useState("");
   const [testSent, setTestSent] = useState(false);
+  const [orient, setOrient] = useState(0); // display rotation (deg): instant, pre-reflash fix
+  const [wantLive, setWantLive] = useState(false); // WebSocket live stream requested
 
   const skewRef = useRef(0);
   const liveWantedRef = useRef(false);
@@ -232,6 +234,9 @@ export default function Viewer() {
   const tickRef = useRef<() => void>(() => {});
   const trackRef = useRef<HTMLDivElement>(null);
   const scrubbingRef = useRef(false);
+  const streamingRef = useRef(false); // true once the live WS is painting frames
+  const liveWsRef = useRef<WebSocket | null>(null);
+  const liveUrlRef = useRef<string | null>(null);
 
   const serverNow = () => Date.now() + skewRef.current;
   const isLive = status ? status.liveUntil > serverNow() : false;
@@ -246,7 +251,9 @@ export default function Viewer() {
     skewRef.current = s.now - Date.now();
     setStatus(s);
     const newest = s.newest;
-    if (newest && newest.path !== lastFramePathRef.current) {
+    // While the live WebSocket is delivering frames, don't let the status poll
+    // overwrite them with the older newest-frame snapshot.
+    if (!streamingRef.current && newest && newest.path !== lastFramePathRef.current) {
       lastFramePathRef.current = newest.path;
       const url = frameUrl(newest.path, newest.at);
       const img = new Image();
@@ -330,7 +337,7 @@ export default function Viewer() {
 
   const loadTimeline = useCallback(async () => {
     try {
-      const res = await fetch(`/api/view/timeline?device=${CAMERA_ID}`, {
+      const res = await fetch(`/api/view/timeline?device=${CAMERA_ID}&hours=1`, {
         cache: "no-store",
       });
       if (!res.ok) return;
@@ -385,6 +392,62 @@ export default function Viewer() {
     return () => clearInterval(id);
   }, [selDevice, loadTelemetry]);
 
+  // Restore the saved display rotation. Instant, no reflash — the stored
+  // frames stay upside-down until the firmware sensor flip lands (device
+  // command), at which point this resets to 0.
+  useEffect(() => {
+    const saved = Number(localStorage.getItem("ghostcam.orient") || 0);
+    if (saved === 90 || saved === 180 || saved === 270) setOrient(saved);
+  }, []);
+
+  const rotateCam = useCallback(() => {
+    setOrient((o) => {
+      const next = (o + 90) % 360;
+      try {
+        localStorage.setItem("ghostcam.orient", String(next));
+      } catch {}
+      return next;
+    });
+  }, []);
+
+  // Live WebSocket stream: when live is requested, subscribe to the relay and
+  // paint incoming JPEG frames straight onto the hero (near-real-time). If the
+  // camera isn't streaming yet, no frames arrive and status polling stays in
+  // charge — so this is a pure enhancement over the existing live view.
+  useEffect(() => {
+    if (!wantLive) return;
+    let closed = false;
+    const proto = window.location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${proto}://${window.location.host}/api/stream/watch`);
+    ws.binaryType = "arraybuffer";
+    liveWsRef.current = ws;
+    ws.onmessage = (ev) => {
+      if (closed || !(ev.data instanceof ArrayBuffer) || ev.data.byteLength < 100) {
+        return;
+      }
+      const url = URL.createObjectURL(new Blob([ev.data], { type: "image/jpeg" }));
+      streamingRef.current = true;
+      if (liveUrlRef.current) URL.revokeObjectURL(liveUrlRef.current);
+      liveUrlRef.current = url;
+      setFrameSrc(url);
+    };
+    ws.onclose = () => {
+      streamingRef.current = false;
+    };
+    return () => {
+      closed = true;
+      streamingRef.current = false;
+      try {
+        ws.close();
+      } catch {}
+      if (liveUrlRef.current) {
+        URL.revokeObjectURL(liveUrlRef.current);
+        liveUrlRef.current = null;
+      }
+      liveWsRef.current = null;
+    };
+  }, [wantLive]);
+
   // load the reviewed frame whenever the scrub index moves
   useEffect(() => {
     if (reviewIndex === null) {
@@ -415,7 +478,7 @@ export default function Viewer() {
         }
         return next;
       });
-    }, 130);
+    }, 50);
     return () => clearInterval(id);
   }, [playing, timeline.length]);
 
@@ -443,9 +506,11 @@ export default function Viewer() {
     try {
       if (isLive || liveWantedRef.current) {
         liveWantedRef.current = false;
+        setWantLive(false);
         await postFlags({ stopLive: true });
       } else {
         liveWantedRef.current = true;
+        setWantLive(true);
         setReviewIndex(null);
         setPlaying(false);
         await postFlags({ goLive: true });
@@ -592,6 +657,63 @@ export default function Viewer() {
     statusText = `offline · last seen ${agoText(age)}`;
   }
 
+  const camTransform =
+    orient === 0
+      ? undefined
+      : orient === 180
+        ? "rotate(180deg)"
+        : `rotate(${orient}deg) scale(0.75)`; // 90/270 fit the 4:3 box
+  const thumbTransform = orient ? `rotate(${orient}deg)` : undefined;
+
+  // Dynamic favicon + tab title: GREEN when the system is "on" (camera online
+  // AND armed or live), RED when it's "off" (offline or disarmed). Drawn to a
+  // canvas each state change and swapped into <link rel="icon">.
+  const systemOn = online && (isLive || !!status?.arm);
+  useEffect(() => {
+    const color = systemOn ? "#34d399" : "#ef4444";
+    const c = document.createElement("canvas");
+    c.width = 64;
+    c.height = 64;
+    const g = c.getContext("2d");
+    if (!g) return;
+    g.clearRect(0, 0, 64, 64);
+    g.fillStyle = "#0b0e13";
+    const rr = g as unknown as { roundRect?: (x: number, y: number, w: number, h: number, r: number) => void };
+    if (typeof rr.roundRect === "function") {
+      g.beginPath();
+      rr.roundRect(2, 2, 60, 60, 15);
+      g.fill();
+    } else {
+      g.fillRect(2, 2, 60, 60);
+    }
+    g.strokeStyle = color;
+    g.lineWidth = 7;
+    g.shadowColor = color;
+    g.shadowBlur = 9;
+    g.beginPath();
+    g.arc(32, 32, 16.5, 0, Math.PI * 2);
+    g.stroke();
+    g.shadowBlur = 0;
+    g.fillStyle = color;
+    g.beginPath();
+    g.arc(32, 32, 7, 0, Math.PI * 2);
+    g.fill();
+    g.fillStyle = "rgba(255,255,255,0.9)";
+    g.beginPath();
+    g.arc(27.5, 27.5, 2.4, 0, Math.PI * 2);
+    g.fill();
+    const href = c.toDataURL("image/png");
+    let link = document.querySelector<HTMLLinkElement>("link#dynfav");
+    if (!link) {
+      link = document.createElement("link");
+      link.id = "dynfav";
+      link.rel = "icon";
+      document.head.appendChild(link);
+    }
+    link.href = href;
+    document.title = systemOn ? "● SAVAGE LAB" : "○ SAVAGE LAB — off";
+  }, [systemOn]);
+
   return (
     <main className="wrap">
       <header className="topbar">
@@ -613,7 +735,11 @@ export default function Viewer() {
       <section className="hero">
         <div className="frame">
           {heroSrc ? (
-            <img src={heroSrc} alt="lab camera" />
+            <img
+              src={heroSrc}
+              alt="lab camera"
+              style={camTransform ? { transform: camTransform } : undefined}
+            />
           ) : (
             <div className="empty">
               {status
@@ -646,6 +772,16 @@ export default function Viewer() {
               📌 Pin
             </button>
           )}
+          {heroSrc && (
+            <button
+              type="button"
+              className="rotbtn"
+              onClick={rotateCam}
+              title="Rotate view"
+            >
+              ⟳{orient ? ` ${orient}°` : ""}
+            </button>
+          )}
           {reviewing && (
             <button type="button" className="livejump" onClick={backToLive}>
               ● LIVE
@@ -660,7 +796,7 @@ export default function Viewer() {
             </span>
             <span className="scrub-meta">
               {timeline.length
-                ? `${timeline.length} frames · last 24h`
+                ? `${timeline.length} frames · last 1h · 1s`
                 : "building timeline…"}
             </span>
           </div>
@@ -684,8 +820,8 @@ export default function Viewer() {
             <div className="track-head" style={{ left: `${fillPct}%` }} />
           </div>
           <div className="track-labels">
-            <span>−24h</span>
-            <span>−12h</span>
+            <span>−60m</span>
+            <span>−30m</span>
             <span>now</span>
           </div>
           <div className="scrub-controls">
@@ -908,6 +1044,7 @@ export default function Viewer() {
                   src={frameUrl(path, "thumb")}
                   alt="motion frame"
                   loading="lazy"
+                  style={thumbTransform ? { transform: thumbTransform } : undefined}
                 />
               </a>
             ))}
@@ -937,6 +1074,7 @@ export default function Viewer() {
                   src={frameUrl(pin.path, "thumb")}
                   alt={pin.label}
                   loading="lazy"
+                  style={thumbTransform ? { transform: thumbTransform } : undefined}
                 />
               </a>
               <button
@@ -954,7 +1092,7 @@ export default function Viewer() {
       )}
 
       <p className="note">
-        24h rolling timeline · pins kept forever · armed = motion alerts on ·{" "}
+        1s timeline · last hour · pins kept forever · armed = motion alerts on ·{" "}
         <button type="button" className="linky" onClick={logout}>
           lock
         </button>

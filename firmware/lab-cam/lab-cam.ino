@@ -35,6 +35,10 @@
 #include "esp_camera.h"
 #include "esp_http_server.h"
 #include "img_converters.h"  // jpg2rgb565 — the motion detector's decoder
+#if USE_WS_STREAM
+#include "esp_crt_bundle.h"       // validate the wss:// TLS cert via the bundle
+#include "esp_websocket_client.h"  // camera → cloud live relay
+#endif
 
 // ── XIAO ESP32S3 Sense pin map ──────────────────────────────────────────
 #define PWDN_GPIO_NUM -1
@@ -101,7 +105,7 @@ static bool initCamera() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
+  config.xclk_freq_hz = 24000000;  // 24 MHz ≈ +20% framerate on the S3
   config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size = FRAME_SIZE;
   config.jpeg_quality = JPEG_QUALITY;
@@ -117,6 +121,22 @@ static bool initCamera() {
     s->set_hmirror(s, prefs.getBool("hmir", CAM_HMIRROR));
     // Let AGC climb further in a dark room: grainy beats black.
     s->set_gainceiling(s, GAINCEILING_32X);
+    // Image tuning — full auto pipeline + a touch more punch. All standard
+    // OV2640 knobs (see xiao-camera/CameraWebServer app_httpd.cpp cmd_handler).
+    s->set_whitebal(s, 1);       // auto white balance on
+    s->set_awb_gain(s, 1);       // AWB gain on
+    s->set_wb_mode(s, 0);        // 0 = auto WB mode
+    s->set_exposure_ctrl(s, 1);  // auto exposure on
+    s->set_aec2(s, 1);           // AEC DSP — better low-light exposure
+    s->set_ae_level(s, 0);       // exposure bias (-2..2)
+    s->set_gain_ctrl(s, 1);      // auto gain on
+    s->set_bpc(s, 1);            // black-pixel correction
+    s->set_wpc(s, 1);            // white-pixel correction
+    s->set_lenc(s, 1);           // lens shading correction
+    s->set_dcw(s, 1);            // advanced downsize/crop (cleaner scaling)
+    s->set_brightness(s, 1);     // -2..2
+    s->set_contrast(s, 1);       // -2..2
+    s->set_saturation(s, 1);     // -2..2
   }
   return true;
 }
@@ -259,6 +279,19 @@ static int64_t jsonInt(const String &s, const char *key, int64_t dflt) {
   return atoll(s.c_str() + at + strlen(key) + 3);
 }
 
+// 180° is the only rotation the OV2640 does in-sensor (vflip+hmirror). The
+// cloud "Rotate" control and the local /flip page both funnel through here.
+static void applyOrientation(bool flip180) {
+  prefs.putBool("vflip", flip180);
+  prefs.putBool("hmir", flip180);
+  sensor_t *s = esp_camera_sensor_get();
+  if (s) {
+    s->set_vflip(s, flip180);
+    s->set_hmirror(s, flip180);
+  }
+  Serial.printf("[cam] orientation: %s\n", flip180 ? "180" : "0");
+}
+
 static void applyFlags(const String &resp) {
   lastCloudOkMs = bootMs();
   if (!armDirty) {
@@ -280,6 +313,12 @@ static void applyFlags(const String &resp) {
       eventRequested = true;
     }
   }
+  // Cloud rotate: dashboard sends "orient":0|180. No-op until it does (-1).
+  int64_t orient = jsonInt(resp, "orient", -1);
+  if (orient == 0 || orient == 180) {
+    bool want180 = (orient == 180);
+    if (want180 != prefs.getBool("vflip", CAM_VFLIP)) applyOrientation(want180);
+  }
 }
 
 // POST one JPEG. The response carries the flags, so a streaming camera hears
@@ -299,6 +338,53 @@ static bool pushFrame(const char *kind, const char *eventId, int seq,
   applyFlags(resp);
   return true;
 }
+
+// ── live WebSocket stream (camera → cloud relay) ────────────────────────────
+// Opened only while a viewer is watching; frames fan out via Redis to the page.
+// Stubs when USE_WS_STREAM=0 so the live loop stays identical (HTTP-only).
+#if USE_WS_STREAM
+static esp_websocket_client_handle_t wsClient = nullptr;
+
+static bool wsEnsureStarted() {
+  if (wsClient) return true;
+  static char uri[288];
+  snprintf(uri, sizeof(uri),
+           "wss://%s/api/stream/ingest?token=%s&device=%s", API_HOST,
+           DEVICE_TOKEN, DEVICE_ID);
+  esp_websocket_client_config_t cfg = {};
+  cfg.uri = uri;
+  cfg.crt_bundle_attach = esp_crt_bundle_attach;
+  cfg.reconnect_timeout_ms = 5000;
+  cfg.network_timeout_ms = 8000;
+  cfg.buffer_size = 4096;
+  wsClient = esp_websocket_client_init(&cfg);
+  if (!wsClient) return false;
+  if (esp_websocket_client_start(wsClient) != ESP_OK) {
+    esp_websocket_client_destroy(wsClient);
+    wsClient = nullptr;
+    return false;
+  }
+  return true;
+}
+
+static void wsStop() {
+  if (!wsClient) return;
+  esp_websocket_client_stop(wsClient);
+  esp_websocket_client_destroy(wsClient);
+  wsClient = nullptr;
+}
+
+static bool wsSendFrame(const uint8_t *jpg, size_t len) {
+  if (!wsClient || !esp_websocket_client_is_connected(wsClient)) return false;
+  int r = esp_websocket_client_send_bin(wsClient, (const char *)jpg, len,
+                                        pdMS_TO_TICKS(1500));
+  return r >= 0;
+}
+#else
+static bool wsEnsureStarted() { return false; }
+static void wsStop() {}
+static bool wsSendFrame(const uint8_t *, size_t) { return false; }
+#endif
 
 // ── lab membership: register + telemetry ────────────────────────────────
 static bool registered = false;
@@ -512,7 +598,7 @@ static esp_err_t streamHandler(httpd_req_t *req) {
                 httpd_resp_send_chunk(req, "\r\n", 2) == ESP_OK;
     free(jpg);
     if (!sent) break;                  // viewer closed the tab
-    vTaskDelay(pdMS_TO_TICKS(70));     // ~10-14 fps
+    vTaskDelay(pdMS_TO_TICKS(30));     // pace local stream; UXGA encode self-limits
   }
   return ESP_OK;
 }
@@ -535,16 +621,7 @@ static esp_err_t armHandler(httpd_req_t *req) {
 
 static esp_err_t flipHandler(httpd_req_t *req) {
   if (!keyOk(req)) return deny(req);
-  bool v = !prefs.getBool("vflip", CAM_VFLIP);
-  bool h = !prefs.getBool("hmir", CAM_HMIRROR);
-  prefs.putBool("vflip", v);
-  prefs.putBool("hmir", h);
-  sensor_t *s = esp_camera_sensor_get();
-  if (s) {
-    s->set_vflip(s, v);
-    s->set_hmirror(s, h);
-  }
-  Serial.printf("[cam] rotated: vflip=%d hmirror=%d\n", v, h);
+  applyOrientation(!prefs.getBool("vflip", CAM_VFLIP));
   httpd_resp_set_type(req, "application/json");
   return httpd_resp_sendstr(req, "{\"ok\":true}");
 }
@@ -722,19 +799,33 @@ static void netTask(void *) {
     }
 
     if (cloudLive) {
-      if (bootMs() - lastLiveFrame >= LIVE_FRAME_MS) {
+      bool ws = wsEnsureStarted();
+      // Keep hearing stop/disarm/test/rotate even while streaming over the WS.
+      if (bootMs() - lastPoll >= (int64_t)POLL_SECONDS * 1000) {
+        lastPoll = bootMs();
+        String resp;
+        if (cloudCall(false, "/api/device/poll", nullptr, 0, nullptr, resp)) {
+          applyFlags(resp);
+        }
+      }
+      // ~6 fps over the socket when connected; else HTTP frame POSTs (whose
+      // responses also carry the flags).
+      if (bootMs() - lastLiveFrame >= (ws ? 150 : LIVE_FRAME_MS)) {
         lastLiveFrame = bootMs();
         size_t len = 0;
         uint8_t *jpg = grabJpeg(&len);
         if (jpg) {
-          pushFrame("live", nullptr, liveSeq++, jpg, len);
+          if (!(ws && wsSendFrame(jpg, len))) {
+            pushFrame("live", nullptr, liveSeq++, jpg, len);
+          }
           free(jpg);
           lastTlFrame = bootMs();  // live frames keep the timeline warm too
         }
       }
-      vTaskDelay(pdMS_TO_TICKS(30));
-      continue;  // frame responses carry the flags while live
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
     }
+    wsStop();  // no viewers → drop the socket
 
     if (bootMs() - lastPoll >= (int64_t)POLL_SECONDS * 1000) {
       lastPoll = bootMs();

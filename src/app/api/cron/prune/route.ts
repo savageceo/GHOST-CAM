@@ -6,6 +6,10 @@ import { pruneAll } from "@/lib/lab";
 // prunes on device writes keep the window tight between runs either way.
 async function authorized(request: Request): Promise<boolean> {
   if (request.headers.get("x-vercel-cron")) return true;
+  const secret = process.env.CRON_SECRET;
+  if (secret && request.headers.get("authorization") === `Bearer ${secret}`) {
+    return true;
+  }
   if (checkDeviceAuth(request)) return true;
   return hasValidSession();
 }

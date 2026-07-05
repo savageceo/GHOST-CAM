@@ -44,3 +44,9 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# firmware secrets — copy config.h.example -> config.h and fill in locally
+firmware/**/config.h
+
+# neon/drizzle local cache
+.neon

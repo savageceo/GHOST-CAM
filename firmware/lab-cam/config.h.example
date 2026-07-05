@@ -8,51 +8,64 @@
 
 // ── network ─────────────────────────────────────────────────────────────────
 #define WIFI_SSID "SAVAGE STUDIO"
-#define WIFI_PASS "Make.Money."
+#define WIFI_PASS "<your-wifi-password>"
 // Optional fallback network. Leave SSID empty to skip.
-#define WIFI_SSID2 ""
-#define WIFI_PASS2 ""
+#define WIFI_SSID2 "N"
+#define WIFI_PASS2 "<fallback-wifi-password-or-empty>"
 // mDNS name → http://roomcam.local on the home network.
 #define HOSTNAME "roomcam"
 
 // ── cloud (SAVAGE LAB / room-watch on Vercel) ───────────────────────────────
 #define API_HOST "room-watch-six.vercel.app"
 // Must match the DEVICE_TOKEN env var on the Vercel project.
-#define DEVICE_TOKEN "4bb9daffafe1e7fb031d700242d11a769017e11269c3173d"
+#define DEVICE_TOKEN "<hex24 — must match Vercel DEVICE_TOKEN env>"
 
 // ── phone alerts (ntfy.sh, no account needed) ───────────────────────────────
 // Subscribe to this topic in the ntfy iPhone app. The name is the password —
 // keep it private.
-#define NTFY_TOPIC "room-watch-alert-58dc0be4d95b"
+#define NTFY_TOPIC "<your-private-ntfy-topic>"
 
 // ── local viewing ───────────────────────────────────────────────────────────
 // Key required on every local URL, so housemates on the WiFi can't watch:
 //   http://roomcam.local/?k=<STREAM_KEY>
-#define STREAM_KEY "1196be308b771e83"
+#define STREAM_KEY "<random hex — local viewing key>"
 
 // ── camera ───────────────────────────────────────────────────────────────────
-// FRAMESIZE_SVGA = 800x600 — the sweet spot for stream + motion detection.
-#define FRAME_SIZE FRAMESIZE_SVGA
-#define FRAME_W 800
-#define FRAME_H 600
-// 10 (best) … 63 (worst). 14 ≈ 30-45 KB per frame.
-#define JPEG_QUALITY 14
-// Flip these if the printed case mounts the board rotated.
-#define CAM_VFLIP 0
-#define CAM_HMIRROR 0
+// Resolution. UXGA 1600x1200 (1.92MP, native 4:3) is the OV2640's max — best
+// detail for stills / timelapse / motion. Want higher live framerate + less
+// bandwidth instead? Drop to FRAMESIZE_XGA (1024x768) or SVGA (800x600) — and
+// update FRAME_W/FRAME_H to match (they size the motion sampler; keep in sync).
+#define FRAME_SIZE FRAMESIZE_UXGA
+#define FRAME_W 1600
+#define FRAME_H 1200
+// 10 (best) … 63 (worst). 12 ≈ crisp. If the camera fails to init at UXGA,
+// nudge toward 14 (very low numbers enlarge the JPEG frame buffers).
+#define JPEG_QUALITY 12
+// Board mounts upside-down → default to a 180° flip so a fresh flash is
+// right-side-up. The cloud "Rotate" control and the local /flip page still
+// change it live (persisted to NVS).
+#define CAM_VFLIP 1
+#define CAM_HMIRROR 1
 
 // ── behavior ─────────────────────────────────────────────────────────────────
 // Armed = motion alerts on. Persisted across reboots once you toggle it.
 #define ARM_DEFAULT 1
 // How often to ask the cloud for arm/live/test flags when idle.
 #define POLL_SECONDS 8
-// One snapshot this often builds the scrubbable 24h timeline AND doubles as
-// the camera's heartbeat. 60s ≈ 1440 frames/day. Raise to save blob writes.
-#define TIMELINE_SECONDS 60
+// One snapshot this often feeds the scrubbable timeline + is the heartbeat.
+// 1s = a smooth "1-second increments over the last hour" timelapse (the app
+// keeps ~3h then prunes). COST: 1s ≈ 3600 Blob writes/hr (~86k/day). If that's
+// too much, raise to 2-5 (still a great timelapse) — it's just this one number.
+#define TIMELINE_SECONDS 1
 // Push chip temp / wifi / memory / uptime this often (feeds sensor charts).
 #define TELEMETRY_SECONDS 60
 // Frame pacing while someone is watching live on the away page.
 #define LIVE_FRAME_MS 700
+// Live transport: 1 = stream live frames over a WebSocket to the cloud relay
+// (near-real-time, ~6 fps). Needs esp_websocket_client in your ESP32 Arduino
+// core; if it won't compile, set 0 to fall back to HTTP frame POSTs (still
+// works, just the old ~1.4 fps live).
+#define USE_WS_STREAM 1
 
 // ── motion detection ─────────────────────────────────────────────────────────
 #define MOTION_SAMPLE_MS 500

@@ -6,7 +6,7 @@ system is a **multi-device lab hub** that any ESP32 gadget (LillyGo T-Embed
 CC1101, NRF bridges, bare sensors) can join with a few lines of code.
 
 Live at **https://room-watch-six.vercel.app** — password unchanged
-(`room-watch-3dc0-fd41`). The camera needs **no reflash** to keep working; flash
+(`<STORAGE_PASSWORD>`). The camera needs **no reflash** to keep working; flash
 the new `lab-cam` firmware when convenient for the richer timeline + telemetry.
 
 ## What's new vs. room-watch
@@ -31,10 +31,10 @@ both ways, "go live" from anywhere.
 
 ## iPhone setup (unchanged)
 
-1. Open **https://room-watch-six.vercel.app**, password `room-watch-3dc0-fd41`,
+1. Open **https://room-watch-six.vercel.app**, password `<STORAGE_PASSWORD>`,
    Share → **Add to Home Screen**.
-2. Alerts: **ntfy** app → subscribe to `room-watch-alert-58dc0be4d95b`.
-3. Home stream (LAN): **http://roomcam.local/?k=1196be308b771e83**.
+2. Alerts: **ntfy** app → subscribe to `<NTFY_TOPIC>`.
+3. Home stream (LAN): **http://roomcam.local/?k=<STREAM_KEY>**.
 
 ## How the data is stored (Vercel Blob, private store)
 

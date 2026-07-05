@@ -24,7 +24,10 @@ export async function GET(request: Request) {
     Number.isFinite(hours) && hours > 0
       ? Math.min(hours, 24 * 14) * HOUR_MS
       : retentionMs();
-  const points = await listTimeline(device, Date.now() - windowMs);
+  // At 1s cadence the last hour is ~3600 frames — lift the cap so the scrubber
+  // keeps true 1-second granularity; wider windows still decimate to 1600.
+  const cap = windowMs <= HOUR_MS ? 3800 : 1600;
+  const points = await listTimeline(device, Date.now() - windowMs, cap);
   return Response.json(
     { device, points, now: Date.now() },
     { headers: { "cache-control": "private, no-store" } },

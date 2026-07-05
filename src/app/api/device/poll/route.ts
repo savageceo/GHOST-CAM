@@ -1,10 +1,16 @@
 import { checkDeviceAuth, readFlags, writeFlags } from "@/lib/store";
 
-function deviceView(flags: { arm: boolean; liveUntil: number; testAt: number }) {
+function deviceView(flags: {
+  arm: boolean;
+  liveUntil: number;
+  testAt: number;
+  orient: number;
+}) {
   return {
     arm: flags.arm,
     live: flags.liveUntil > Date.now(),
     testAt: flags.testAt,
+    orient: flags.orient,
   };
 }
 

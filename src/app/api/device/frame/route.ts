@@ -6,13 +6,14 @@ import {
   MOTION_PREFIX,
   pruneLiveFrames,
   readFlags,
+  recordMotionFrame,
 } from "@/lib/store";
 import {
   CAMERA_DEVICE_ID,
   pruneTimeline,
+  recordFrame,
   timelinePath,
   validDeviceId,
-  writeLatest,
 } from "@/lib/lab";
 
 const MAX_FRAME_BYTES = 2 * 1024 * 1024;
@@ -48,19 +49,21 @@ export async function POST(request: Request) {
   let path: string;
   let pruneLive = false;
   let pruneTl = false;
+  let motionEvent = "";
+  let motionSeq = -1;
 
   if (kind === "motion") {
-    const event = searchParams.get("event") ?? "";
-    const seq = Number(searchParams.get("seq") ?? "");
+    motionEvent = searchParams.get("event") ?? "";
+    motionSeq = Number(searchParams.get("seq") ?? "");
     if (
-      !/^[A-Za-z0-9][A-Za-z0-9_-]{0,49}$/.test(event) ||
-      !Number.isInteger(seq) ||
-      seq < 0 ||
-      seq > 99
+      !/^[A-Za-z0-9][A-Za-z0-9_-]{0,49}$/.test(motionEvent) ||
+      !Number.isInteger(motionSeq) ||
+      motionSeq < 0 ||
+      motionSeq > 99
     ) {
       return Response.json({ error: "bad event" }, { status: 400 });
     }
-    path = `${MOTION_PREFIX}${event}/${String(seq).padStart(2, "0")}.jpg`;
+    path = `${MOTION_PREFIX}${motionEvent}/${String(motionSeq).padStart(2, "0")}.jpg`;
   } else if (kind === "timeline" || kind === "idle") {
     path = timelinePath(device, now);
     pruneTl = Math.random() < 0.05; // opportunistic 24h retention sweep
@@ -77,17 +80,22 @@ export async function POST(request: Request) {
     contentType: "image/jpeg",
   });
 
-  // Hero view + heartbeat pointer. Every capture except mid-burst motion
-  // frames advances "newest" so the dashboard reacts instantly.
-  const isBurstTail = kind === "motion" && path.slice(-6) !== "00.jpg";
-  if (!isBurstTail) {
+  // Index the frame. Motion bursts group under their event id; the first burst
+  // frame also lands in `frames` so it becomes the newest hero shot.
+  if (kind === "motion") {
     try {
-      await writeLatest({
-        path,
-        at: now,
+      await recordMotionFrame(motionEvent, device, now, path, motionSeq);
+    } catch {}
+    if (motionSeq === 0) {
+      try {
+        await recordFrame(device, "motion", now, path, { sd, rssi: cleanRssi });
+      } catch {}
+    }
+  } else {
+    try {
+      await recordFrame(device, kind === "idle" ? "timeline" : kind, now, path, {
         sd,
         rssi: cleanRssi,
-        kind: kind === "idle" ? "timeline" : kind,
       });
     } catch {}
   }
@@ -109,5 +117,6 @@ export async function POST(request: Request) {
     arm: flags.arm,
     live: flags.liveUntil > Date.now(),
     testAt: flags.testAt,
+    orient: flags.orient,
   });
 }

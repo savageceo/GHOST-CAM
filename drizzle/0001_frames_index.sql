@@ -1,0 +1,1 @@
+CREATE INDEX "frames_device_at_idx" ON "frames" USING btree ("device_id","at");

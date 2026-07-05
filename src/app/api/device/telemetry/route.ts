@@ -53,6 +53,7 @@ export async function POST(request: Request) {
     arm: flags.arm,
     live: flags.liveUntil > Date.now(),
     testAt: flags.testAt,
+    orient: flags.orient,
   });
 }
 

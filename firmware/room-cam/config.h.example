@@ -2,27 +2,27 @@
 
 // ── network ─────────────────────────────────────────────────────────────
 #define WIFI_SSID "SAVAGE STUDIO"
-#define WIFI_PASS "Make.Money."
+#define WIFI_PASS "<your-wifi-password>"
 // Optional fallback network. Leave SSID empty to skip.
-#define WIFI_SSID2 ""
-#define WIFI_PASS2 ""
+#define WIFI_SSID2 "N"
+#define WIFI_PASS2 "<fallback-wifi-password-or-empty>"
 // mDNS name → http://roomcam.local on the home network.
 #define HOSTNAME "roomcam"
 
 // ── cloud (room-watch on Vercel) ────────────────────────────────────────
 #define API_HOST "room-watch-six.vercel.app"
 // Must match the DEVICE_TOKEN env var on the Vercel project.
-#define DEVICE_TOKEN "4bb9daffafe1e7fb031d700242d11a769017e11269c3173d"
+#define DEVICE_TOKEN "<hex24 — must match Vercel DEVICE_TOKEN env>"
 
 // ── phone alerts (ntfy.sh, no account needed) ───────────────────────────
 // Subscribe to this topic in the ntfy iPhone app. The name is the password —
 // keep it private.
-#define NTFY_TOPIC "room-watch-alert-58dc0be4d95b"
+#define NTFY_TOPIC "<your-private-ntfy-topic>"
 
 // ── local viewing ───────────────────────────────────────────────────────
 // Key required on every local URL, so housemates on the WiFi can't watch:
 //   http://roomcam.local/?k=<STREAM_KEY>
-#define STREAM_KEY "1196be308b771e83"
+#define STREAM_KEY "<random hex — local viewing key>"
 
 // ── camera ──────────────────────────────────────────────────────────────
 // FRAMESIZE_SVGA = 800x600 — the sweet spot for stream + motion detection.
