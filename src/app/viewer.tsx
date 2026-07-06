@@ -226,6 +226,7 @@ export default function Viewer() {
   const [testSent, setTestSent] = useState(false);
   const [orient, setOrient] = useState(0); // display rotation (deg): instant, pre-reflash fix
   const [wantLive, setWantLive] = useState(false); // WebSocket live stream requested
+  const [livePainting, setLivePainting] = useState(false); // live WS frames on screen
 
   const skewRef = useRef(0);
   const liveWantedRef = useRef(false);
@@ -237,6 +238,8 @@ export default function Viewer() {
   const streamingRef = useRef(false); // true once the live WS is painting frames
   const liveWsRef = useRef<WebSocket | null>(null);
   const liveUrlRef = useRef<string | null>(null);
+  const heroImgRef = useRef<HTMLImageElement>(null); // hero <img>, painted imperatively
+  const paintingRef = useRef(false); // guards the one-time livePainting reveal
 
   const serverNow = () => Date.now() + skewRef.current;
   const isLive = status ? status.liveUntil > serverNow() : false;
@@ -425,18 +428,31 @@ export default function Viewer() {
       if (closed || !(ev.data instanceof ArrayBuffer) || ev.data.byteLength < 100) {
         return;
       }
+      const img = heroImgRef.current;
+      if (!img) return;
       const url = URL.createObjectURL(new Blob([ev.data], { type: "image/jpeg" }));
       streamingRef.current = true;
-      if (liveUrlRef.current) URL.revokeObjectURL(liveUrlRef.current);
+      // Paint straight into the <img> — bypassing React state means we don't
+      // re-render the whole dashboard on every frame, which is what lets a
+      // 10–20 fps stream stay smooth. Revoke the prior blob after the swap.
+      img.src = url;
+      const prev = liveUrlRef.current;
       liveUrlRef.current = url;
-      setFrameSrc(url);
+      if (prev) URL.revokeObjectURL(prev);
+      if (!paintingRef.current) {
+        paintingRef.current = true;
+        setLivePainting(true); // one render to reveal the <img> / hide placeholder
+      }
     };
     ws.onclose = () => {
       streamingRef.current = false;
+      paintingRef.current = false;
     };
     return () => {
       closed = true;
       streamingRef.current = false;
+      paintingRef.current = false;
+      setLivePainting(false);
       try {
         ws.close();
       } catch {}
@@ -636,6 +652,7 @@ export default function Viewer() {
   ).length;
   const reviewPoint = reviewing ? timeline[reviewIndex] : null;
   const heroSrc = reviewing ? reviewSrc : frameSrc;
+  const hasImage = !!heroSrc || livePainting;
   const fillPct = reviewing
     ? timeline.length > 1
       ? (reviewIndex / (timeline.length - 1)) * 100
@@ -664,6 +681,15 @@ export default function Viewer() {
         ? "rotate(180deg)"
         : `rotate(${orient}deg) scale(0.75)`; // 90/270 fit the 4:3 box
   const thumbTransform = orient ? `rotate(${orient}deg)` : undefined;
+
+  // Paint non-live sources (status snapshots, scrubbed timeline frames) into the
+  // same hero <img> the live stream writes to. Skipped while the WS is painting
+  // so the two never fight; re-runs when live stops to restore the latest still.
+  useEffect(() => {
+    if (streamingRef.current) return;
+    const img = heroImgRef.current;
+    if (img && heroSrc) img.src = heroSrc;
+  }, [heroSrc, livePainting]);
 
   // Dynamic favicon + tab title: GREEN when the system is "on" (camera online
   // AND armed or live), RED when it's "off" (offline or disarmed). Drawn to a
@@ -734,20 +760,22 @@ export default function Viewer() {
 
       <section className="hero">
         <div className="frame">
-          {heroSrc ? (
-            <img
-              src={heroSrc}
-              alt="lab camera"
-              style={camTransform ? { transform: camTransform } : undefined}
-            />
-          ) : (
+          <img
+            ref={heroImgRef}
+            alt="lab camera"
+            style={{
+              display: hasImage ? "block" : "none",
+              ...(camTransform ? { transform: camTransform } : {}),
+            }}
+          />
+          {!hasImage && (
             <div className="empty">
               {status
                 ? "no frame yet — the camera sends one within a couple minutes of coming online"
                 : "connecting…"}
             </div>
           )}
-          {heroSrc && (
+          {hasImage && (
             <span
               className={`stamp ${
                 reviewing ? "review" : isLive && age < 20000 ? "live" : ""
@@ -762,7 +790,7 @@ export default function Viewer() {
                     : ""}
             </span>
           )}
-          {heroSrc && (
+          {hasImage && (
             <button
               type="button"
               className="pinbtn"
@@ -772,7 +800,7 @@ export default function Viewer() {
               📌 Pin
             </button>
           )}
-          {heroSrc && (
+          {hasImage && (
             <button
               type="button"
               className="rotbtn"

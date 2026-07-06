@@ -11,8 +11,9 @@
 //   · TELEMETRY: chip temp / wifi / free memory / uptime every TELEMETRY_SECONDS
 //     → live sensor charts on the dashboard
 //   · self-registers in the device grid on boot (name/type/caps/firmware)
-//   · "go live" from the cloud: camera streams ~1.5 fps to the page in 90s
-//     windows while you watch, from anywhere
+//   · "go live" from the cloud: while you watch, the sensor drops to a fast
+//     live size (HD, ~10-14 fps over the WebSocket relay) and pushes frames in
+//     near-real-time, then returns to UXGA for crisp stills when you stop
 //
 // Split across cores like bunny-hop: capture/motion on core 1, WiFi + uploads
 // on core 0, camera behind one mutex, SD behind another.
@@ -34,10 +35,15 @@
 
 #include "esp_camera.h"
 #include "esp_http_server.h"
-#include "img_converters.h"  // jpg2rgb565 — the motion detector's decoder
+#include <JPEGDEC.h>  // motion decoder (bitbank2). The core-3.x esp_jpeg/tjpgd
+                      // decoder rejects the OV2640's JPEGs (JDR_FMT1); JPEGDEC
+                      // decodes them fine. Install: arduino-cli lib install JPEGDEC
 #if USE_WS_STREAM
-#include "esp_crt_bundle.h"       // validate the wss:// TLS cert via the bundle
-#include "esp_websocket_client.h"  // camera → cloud live relay
+// WSS live-relay client. Arduino-ESP32 3.x no longer ships esp_websocket_client,
+// so we use the "ArduinoWebsockets" library (gilmaimon) — install it with:
+//   arduino-cli lib install ArduinoWebsockets
+// or Library Manager → "ArduinoWebsockets".
+#include <ArduinoWebsockets.h>
 #endif
 
 // ── XIAO ESP32S3 Sense pin map ──────────────────────────────────────────
@@ -67,6 +73,7 @@ static volatile bool sdOk = false;
 static volatile bool armed = ARM_DEFAULT;
 static volatile bool armDirty = false;   // local toggle waiting to reach cloud
 static volatile bool cloudLive = false;  // cloud says someone is watching
+static volatile bool liveCaptureActive = false;  // sensor is in fast live-view mode
 static volatile bool eventRequested = false;
 static volatile bool eventIsTest = false;
 static int64_t lastTestAt = -1;  // -1 until primed by first cloud contact
@@ -105,7 +112,8 @@ static bool initCamera() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 24000000;  // 24 MHz ≈ +20% framerate on the S3
+  config.xclk_freq_hz = 20000000;  // 20 MHz: stable OV2640 JPEGs (24 MHz emits
+                                   // oversized/malformed frames strict decoders reject)
   config.pixel_format = PIXFORMAT_JPEG;
   config.frame_size = FRAME_SIZE;
   config.jpeg_quality = JPEG_QUALITY;
@@ -163,11 +171,46 @@ static uint8_t *grabJpeg(size_t *outLen) {
   return copy;
 }
 
+// Live view trades resolution for frame rate; saved stills stay UXGA. We only
+// switch the sensor at live start/stop (not per frame), so the brief reconfigure
+// is rare and cheap. No-op build when LIVE_DOWNSCALE=0 (one size for everything).
+static void applyCaptureMode(bool live) {
+#if LIVE_DOWNSCALE
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) return;
+  xSemaphoreTake(fbMutex, portMAX_DELAY);
+  s->set_framesize(s, live ? LIVE_FRAME_SIZE : FRAME_SIZE);
+  s->set_quality(s, live ? LIVE_JPEG_QUALITY : JPEG_QUALITY);
+  camera_fb_t *fb = esp_camera_fb_get();  // flush one frame at the old geometry
+  if (fb) esp_camera_fb_return(fb);
+  xSemaphoreGive(fbMutex);
+  vTaskDelay(pdMS_TO_TICKS(120));  // let AE/AWB settle at the new size
+  Serial.printf("[cam] capture mode: %s\n", live ? "live (fast)" : "still (UXGA)");
+#else
+  (void)live;
+#endif
+}
+
 // ── microSD archive (optional) ──────────────────────────────────────────
 
 static bool initSd() {
-  bool ok = SD.begin(SD_CS_PIN) && (SD.exists("/events") || SD.mkdir("/events"));
-  return ok;
+  SD.end();  // clear any half-open state so a re-seat / retry can remount cleanly
+  // Last arg = format_if_mount_failed: with SD_FORMAT_ON_FAIL=1 an unmountable
+  // (e.g. exFAT) card is reformatted FAT32 on the spot; keep it 0 in normal use.
+  if (!SD.begin(SD_CS_PIN, SPI, 4000000, "/sd", 5, SD_FORMAT_ON_FAIL)) {
+    Serial.println("[sd] mount failed — check the card is fully seated and "
+                   "formatted FAT32 (exFAT / 64GB+ default won't mount)");
+    return false;
+  }
+  sdcard_type_t ct = SD.cardType();
+  if (ct == CARD_NONE) {
+    Serial.println("[sd] no card detected");
+    return false;
+  }
+  Serial.printf("[sd] card ok — type %d, %llu MB free of %llu MB\n", (int)ct,
+                (SD.totalBytes() - SD.usedBytes()) / (1024ULL * 1024ULL),
+                SD.cardSize() / (1024ULL * 1024ULL));
+  return SD.exists("/events") || SD.mkdir("/events");
 }
 
 static void sdSaveFrame(const char *eventId, int seq, const uint8_t *jpg,
@@ -292,6 +335,23 @@ static void applyOrientation(bool flip180) {
   Serial.printf("[cam] orientation: %s\n", flip180 ? "180" : "0");
 }
 
+#if NIGHT_MODE
+// Auto low-light: raise gain ceiling + exposure bias + brightness when the scene
+// goes dark, restore daylight defaults when it brightens. Driven by the motion
+// sampler's measured brightness (see motionTask). Plain SCCB writes — no lock.
+static bool nightActive = false;
+static void applyNightMode(bool night) {
+  if (night == nightActive) return;
+  nightActive = night;
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) return;
+  s->set_gainceiling(s, night ? GAINCEILING_128X : GAINCEILING_32X);
+  s->set_ae_level(s, night ? 2 : 0);
+  s->set_brightness(s, night ? 2 : 1);
+  Serial.printf("[cam] night mode %s\n", night ? "ON" : "off");
+}
+#endif
+
 static void applyFlags(const String &resp) {
   lastCloudOkMs = bootMs();
   if (!armDirty) {
@@ -343,42 +403,39 @@ static bool pushFrame(const char *kind, const char *eventId, int seq,
 // Opened only while a viewer is watching; frames fan out via Redis to the page.
 // Stubs when USE_WS_STREAM=0 so the live loop stays identical (HTTP-only).
 #if USE_WS_STREAM
-static esp_websocket_client_handle_t wsClient = nullptr;
+static websockets::WebsocketsClient wsClient;
 
+// (Re)open the relay socket while a viewer is watching. connect() blocks on the
+// TLS + WS handshake, so we only pay it when disconnected; once up we just
+// poll() to service control frames and notice a server-side close.
 static bool wsEnsureStarted() {
-  if (wsClient) return true;
+  if (wsClient.available()) {
+    wsClient.poll();
+    return true;
+  }
   static char uri[288];
   snprintf(uri, sizeof(uri),
            "wss://%s/api/stream/ingest?token=%s&device=%s", API_HOST,
            DEVICE_TOKEN, DEVICE_ID);
-  esp_websocket_client_config_t cfg = {};
-  cfg.uri = uri;
-  cfg.crt_bundle_attach = esp_crt_bundle_attach;
-  cfg.reconnect_timeout_ms = 5000;
-  cfg.network_timeout_ms = 8000;
-  cfg.buffer_size = 4096;
-  wsClient = esp_websocket_client_init(&cfg);
-  if (!wsClient) return false;
-  if (esp_websocket_client_start(wsClient) != ESP_OK) {
-    esp_websocket_client_destroy(wsClient);
-    wsClient = nullptr;
-    return false;
-  }
-  return true;
+  wsClient.setInsecure();  // bearer token in the URL carries the trust (as cloudTls)
+  bool ok = wsClient.connect(uri);
+  if (ok) Serial.println("[ws] relay connected");
+  return ok;
 }
 
 static void wsStop() {
-  if (!wsClient) return;
-  esp_websocket_client_stop(wsClient);
-  esp_websocket_client_destroy(wsClient);
-  wsClient = nullptr;
+  if (wsClient.available()) {
+    wsClient.close();
+    Serial.println("[ws] relay closed (no viewers)");
+  }
 }
 
+// One WebSocket binary message per JPEG. The library masks + frames it; the
+// underlying TLS write blocks when the TCP buffer is full, which is what paces
+// the live loop to the real link rate.
 static bool wsSendFrame(const uint8_t *jpg, size_t len) {
-  if (!wsClient || !esp_websocket_client_is_connected(wsClient)) return false;
-  int r = esp_websocket_client_send_bin(wsClient, (const char *)jpg, len,
-                                        pdMS_TO_TICKS(1500));
-  return r >= 0;
+  if (!wsClient.available()) return false;
+  return wsClient.sendBinary((const char *)jpg, len);
 }
 #else
 static bool wsEnsureStarted() { return false; }
@@ -483,16 +540,48 @@ static void runEvent(bool isTest) {
 // Decode every sample at 1/8 scale (SVGA → 100×75), reduce to brightness,
 // diff against the previous sample. Cheap enough to run forever.
 
+static JPEGDEC jpeg;
+static uint8_t *g_bright = nullptr;  // brightness map the decode callback fills
+static int g_bw = 0, g_bh = 0;
+
+// JPEGDEC draw callback: reduce this MCU block's RGB565 pixels to brightness and
+// store into the coarse map. iWidth is the row stride; iWidthUsed clips edges.
+static int motionDraw(JPEGDRAW *p) {
+  const uint16_t *px = p->pPixels;  // RGB565 little-endian
+  for (int row = 0; row < p->iHeight; row++) {
+    int yy = p->y + row;
+    if (yy < 0 || yy >= g_bh) continue;
+    for (int col = 0; col < p->iWidthUsed; col++) {
+      int xx = p->x + col;
+      if (xx < 0 || xx >= g_bw) continue;
+      uint16_t v = px[row * p->iWidth + col];
+      uint8_t r = (v >> 11) & 0x1f, g = (v >> 5) & 0x3f, b = v & 0x1f;
+      g_bright[yy * g_bw + xx] = (uint8_t)((r * 3 + g * 3 + b * 2) >> 1);
+    }
+  }
+  return 1;
+}
+
 static void motionTask(void *) {
-  const int w = FRAME_W / 8, h = FRAME_H / 8, n = w * h;
-  uint8_t *rgb = (uint8_t *)heap_caps_malloc(n * 2, MALLOC_CAP_SPIRAM);
+#if MOTION_SCALE_DIV == 2
+  const int scaleOpt = JPEG_SCALE_HALF;
+#elif MOTION_SCALE_DIV == 4
+  const int scaleOpt = JPEG_SCALE_QUARTER;
+#else
+  const int scaleOpt = JPEG_SCALE_EIGHTH;
+#endif
+  const int w = FRAME_W / MOTION_SCALE_DIV, h = FRAME_H / MOTION_SCALE_DIV,
+            n = w * h;
   uint8_t *prev = (uint8_t *)heap_caps_malloc(n, MALLOC_CAP_SPIRAM);
   uint8_t *cur = (uint8_t *)heap_caps_malloc(n, MALLOC_CAP_SPIRAM);
-  if (!rgb || !prev || !cur) {
+  if (!prev || !cur) {
     Serial.println("[motion] buffer alloc failed — detector off");
     vTaskDelete(nullptr);
     return;
   }
+  g_bw = w;
+  g_bh = h;
+  Serial.printf("[motion] detector on — %dx%d @ 1/%d\n", w, h, MOTION_SCALE_DIV);
   bool havePrev = false;
   int hits = 0;
   int64_t lastEventMs = -(int64_t)MOTION_COOLDOWN_S * 1000;
@@ -500,18 +589,51 @@ static void motionTask(void *) {
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(MOTION_SAMPLE_MS));
     if (!camOk || eventRequested) continue;
+#if LIVE_DOWNSCALE
+    // Live-view runs the sensor at a different geometry than these buffers, and
+    // someone's already watching — pause detection and re-prime when live ends.
+    if (liveCaptureActive) {
+      havePrev = false;
+      continue;
+    }
+#endif
     size_t len = 0;
     uint8_t *jpg = grabJpeg(&len);
     if (!jpg) continue;
-    bool decoded = jpg2rgb565(jpg, len, rgb, JPEG_IMAGE_SCALE_1_8);
-    free(jpg);
-    if (!decoded) continue;
-
-    for (int i = 0; i < n; i++) {
-      uint16_t px = ((uint16_t)rgb[i * 2] << 8) | rgb[i * 2 + 1];
-      uint8_t r = (px >> 11) & 0x1f, g = (px >> 5) & 0x3f, b = px & 0x1f;
-      cur[i] = (uint8_t)((r * 3 + g * 3 + b * 2) >> 1);  // ~0-255 brightness
+    // Decode straight to 8-bit grayscale at 1/MOTION_SCALE_DIV into `cur`.
+    g_bright = cur;
+    bool decoded = false;
+    int derr = 0;
+    if (jpeg.openRAM(jpg, (int)len, motionDraw)) {
+      jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+      decoded = (jpeg.decode(0, 0, scaleOpt) == 1);
+      derr = jpeg.getLastError();
+      jpeg.close();
+    } else {
+      derr = jpeg.getLastError();
     }
+    free(jpg);
+    if (!decoded) {
+      static int64_t lastErrLog = 0;
+      if (bootMs() - lastErrLog > 3000) {  // rate-limited decode-fail diagnostic
+        lastErrLog = bootMs();
+        Serial.printf("[motion] decode failed len=%u err=%d\n", (unsigned)len,
+                      derr);
+      }
+      continue;
+    }
+
+#if NIGHT_MODE
+    {  // auto day/night from average scene brightness (hysteresis band)
+      long sum = 0;
+      for (int i = 0; i < n; i++) sum += cur[i];
+      float avg = (float)sum / n;
+      static float lumaEma = -1;
+      lumaEma = (lumaEma < 0) ? avg : (lumaEma * 0.95f + avg * 0.05f);
+      applyNightMode(nightActive ? (lumaEma < NIGHT_EXIT_LUMA)
+                                 : (lumaEma < NIGHT_ENTER_LUMA));
+    }
+#endif
 
     if (havePrev) {
       int changed = 0;
@@ -521,6 +643,13 @@ static void motionTask(void *) {
         if (d > MOTION_PIXEL_DELTA) changed++;
       }
       float pct = 100.0f * changed / n;
+      // Proof-of-life + tuning aid: log the current motion level every ~10s.
+      static int64_t lastMotionLog = 0;
+      if (bootMs() - lastMotionLog > 10000) {
+        lastMotionLog = bootMs();
+        Serial.printf("[motion] %.1f%% change (armed=%s)\n", pct,
+                      armed ? "yes" : "no");
+      }
       hits = (pct >= MOTION_TRIGGER_PCT) ? hits + 1 : 0;
       if (hits >= MOTION_CONSEC && armed && !eventRequested &&
           bootMs() > (int64_t)BOOT_GRACE_S * 1000 &&
@@ -757,6 +886,8 @@ static void netTask(void *) {
   int64_t lastTelemetry = -(int64_t)TELEMETRY_SECONDS * 1000;
   int64_t lastLiveFrame = 0;
   int liveSeq = 0;
+  int64_t fpsWindowMs = 0;  // live-fps report window (serial diagnostic)
+  int fpsCount = 0;
 
   for (;;) {
     if (WiFi.status() != WL_CONNECTED) {
@@ -800,6 +931,12 @@ static void netTask(void *) {
 
     if (cloudLive) {
       bool ws = wsEnsureStarted();
+      if (!liveCaptureActive) {  // entering live → pause motion, then downscale
+        liveCaptureActive = true;
+        applyCaptureMode(true);
+        fpsWindowMs = bootMs();
+        fpsCount = 0;
+      }
       // Keep hearing stop/disarm/test/rotate even while streaming over the WS.
       if (bootMs() - lastPoll >= (int64_t)POLL_SECONDS * 1000) {
         lastPoll = bootMs();
@@ -808,9 +945,11 @@ static void netTask(void *) {
           applyFlags(resp);
         }
       }
-      // ~6 fps over the socket when connected; else HTTP frame POSTs (whose
-      // responses also carry the flags).
-      if (bootMs() - lastLiveFrame >= (ws ? 150 : LIVE_FRAME_MS)) {
+      // Over the socket: stream as fast as WiFi drains — wsSendFrame() blocks
+      // when the tx buffer is full, so it self-paces at the true link rate;
+      // LIVE_MIN_INTERVAL_MS is only a floor. HTTP fallback stays paced.
+      if (bootMs() - lastLiveFrame >=
+          (ws ? (int64_t)LIVE_MIN_INTERVAL_MS : (int64_t)LIVE_FRAME_MS)) {
         lastLiveFrame = bootMs();
         size_t len = 0;
         uint8_t *jpg = grabJpeg(&len);
@@ -819,11 +958,23 @@ static void netTask(void *) {
             pushFrame("live", nullptr, liveSeq++, jpg, len);
           }
           free(jpg);
-          lastTlFrame = bootMs();  // live frames keep the timeline warm too
+          lastTlFrame = bootMs();  // timeline pauses while live is on
+          fpsCount++;
         }
       }
-      vTaskDelay(pdMS_TO_TICKS(20));
+      if (bootMs() - fpsWindowMs >= 5000) {  // report live fps on serial for tuning
+        Serial.printf("[live] %.1f fps over %s\n",
+                      fpsCount * 1000.0 / (bootMs() - fpsWindowMs),
+                      ws ? "websocket" : "http");
+        fpsWindowMs = bootMs();
+        fpsCount = 0;
+      }
+      vTaskDelay(pdMS_TO_TICKS(ws ? 3 : 20));  // tiny yield; the send self-paces
       continue;
+    }
+    if (liveCaptureActive) {  // leaving live → restore UXGA stills
+      applyCaptureMode(false);
+      liveCaptureActive = false;
     }
     wsStop();  // no viewers → drop the socket
 
@@ -887,7 +1038,7 @@ void setup() {
 
   startLocalServers();
 
-  xTaskCreatePinnedToCore(motionTask, "motion", 8192, nullptr, 1, nullptr, 1);
+  xTaskCreatePinnedToCore(motionTask, "motion", 12288, nullptr, 1, nullptr, 1);
   xTaskCreatePinnedToCore(netTask, "net", 16384, nullptr, 1, nullptr, 0);
   Serial.printf("[lab-cam] device=%s armed=%s\n", DEVICE_ID,
                 armed ? "yes" : "no");

@@ -30,22 +30,40 @@
 //   http://roomcam.local/?k=<STREAM_KEY>
 #define STREAM_KEY "<random hex — local viewing key>"
 
-// ── camera ───────────────────────────────────────────────────────────────────
-// Resolution. UXGA 1600x1200 (1.92MP, native 4:3) is the OV2640's max — best
-// detail for stills / timelapse / motion. Want higher live framerate + less
-// bandwidth instead? Drop to FRAMESIZE_XGA (1024x768) or SVGA (800x600) — and
-// update FRAME_W/FRAME_H to match (they size the motion sampler; keep in sync).
+// ── camera: still capture (timeline · motion · pins · LAN MJPEG) ─────────────
+// UXGA 1600x1200 (1.92MP, native 4:3) is the OV2640's max — the sharpest the
+// sensor can do. Every *saved* frame (1s timeline, motion bursts, pins) uses
+// this. The live away-page stream uses a separate, faster size below, so you
+// keep max-detail stills AND a smooth live view at the same time.
 #define FRAME_SIZE FRAMESIZE_UXGA
-#define FRAME_W 1600
-#define FRAME_H 1200
+#define FRAME_W 1600  // still width  — also sizes the motion sampler (keep in sync)
+#define FRAME_H 1200  // still height
 // 10 (best) … 63 (worst). 12 ≈ crisp. If the camera fails to init at UXGA,
-// nudge toward 14 (very low numbers enlarge the JPEG frame buffers).
+// nudge toward 14 (very low numbers enlarge the JPEG frame buffers in PSRAM).
 #define JPEG_QUALITY 12
-// Board mounts upside-down → default to a 180° flip so a fresh flash is
-// right-side-up. The cloud "Rotate" control and the local /flip page still
-// change it live (persisted to NVS).
-#define CAM_VFLIP 1
-#define CAM_HMIRROR 1
+
+// ── camera: live stream (the away-page WebSocket view) ───────────────────────
+// Live trades resolution for frame rate: the XIAO's 2.4GHz WiFi sustains only
+// ~2–4 Mbps of JPEG upload, so a smaller live frame = more fps. The sensor is
+// switched to LIVE_FRAME_SIZE only while someone is watching, then back to UXGA
+// for stills. Rough live fps over solid WiFi (saved stills stay UXGA either way):
+//     VGA  640x480   ~20–30 fps      XGA  1024x768  ~8–12 fps
+//     SVGA 800x600   ~16–24 fps      HD   1280x720  ~10–14 fps   (default)
+//     UXGA 1600x1200 ~4–6 fps
+// Set LIVE_DOWNSCALE 0 to stream at FRAME_SIZE (one resolution for everything).
+#define LIVE_DOWNSCALE 1              // 1 = fast live size below; 0 = live at FRAME_SIZE
+#define LIVE_FRAME_SIZE FRAMESIZE_HD  // live resolution (16:9, fills modern screens)
+#define LIVE_JPEG_QUALITY 11          // live JPEG quality (10 best … 63 worst)
+// Minimum gap between live frames, ms. 0 = uncapped — stream as fast as WiFi
+// drains (the WebSocket send back-pressures naturally, so it self-paces). Raise
+// to cap fps / save data: 66≈15fps, 100≈10fps, 150≈6fps.
+#define LIVE_MIN_INTERVAL_MS 0
+
+// Camera orientation default: 1 = 180° flip (upside-down mount), 0 = no flip.
+// The cloud "Rotate"/orient flag and the local /flip page override this live and
+// persist to NVS, so this only sets a fresh flash's starting orientation.
+#define CAM_VFLIP 0
+#define CAM_HMIRROR 0
 
 // ── behavior ─────────────────────────────────────────────────────────────────
 // Armed = motion alerts on. Persisted across reboots once you toggle it.
@@ -59,15 +77,20 @@
 #define TIMELINE_SECONDS 1
 // Push chip temp / wifi / memory / uptime this often (feeds sensor charts).
 #define TELEMETRY_SECONDS 60
-// Frame pacing while someone is watching live on the away page.
+// HTTP-fallback pacing — only used when USE_WS_STREAM=0 or the socket is down.
 #define LIVE_FRAME_MS 700
-// Live transport: 1 = stream live frames over a WebSocket to the cloud relay
-// (near-real-time, ~6 fps). Needs esp_websocket_client in your ESP32 Arduino
-// core; if it won't compile, set 0 to fall back to HTTP frame POSTs (still
-// works, just the old ~1.4 fps live).
+// Live transport: 1 = stream frames over a WebSocket to the cloud relay
+// (near-real-time; HD ~10–14 fps with the defaults above). Needs
+// esp_websocket_client in your ESP32 Arduino core (bundled in 3.x); if it won't
+// compile, set 0 to fall back to HTTP frame POSTs (~1.4 fps live).
 #define USE_WS_STREAM 1
 
 // ── motion detection ─────────────────────────────────────────────────────────
+// Motion sampler JPEG decode-scale divisor (8, 4, or 2). Frames are decoded to
+// grayscale by the JPEGDEC library — the core-3.x esp_jpeg/tjpgd decoder can't
+// read the OV2640's JPEGs at all (logs "Error in decoding JPEG image! 6"). 8 =
+// 1/8 (200x150 at UXGA), plenty for motion; smaller = finer but more CPU/PSRAM.
+#define MOTION_SCALE_DIV 8
 #define MOTION_SAMPLE_MS 500
 // A pixel "changed" when its brightness moves more than this (0-255)…
 #define MOTION_PIXEL_DELTA 26
@@ -87,3 +110,17 @@
 #define SD_CS_PIN 21
 // Ring buffer: delete oldest events when free space drops below this.
 #define SD_MIN_FREE_MB 200
+// One-time reformat: set 1 to reformat the card to FAT32 when it won't mount
+// (fixes exFAT / 64GB+ cards the SD lib can't read), reflash, then set back to
+// 0. WIPES the card — leave at 0 in normal use so a glitch can't erase it.
+#define SD_FORMAT_ON_FAIL 0
+
+// ── night mode (auto low-light) ─────────────────────────────────────────────
+// Auto day/night: the motion sampler measures average scene brightness (0-255);
+// when it falls below NIGHT_ENTER_LUMA the sensor cranks gain/exposure for a
+// usable low-light picture, and restores daylight settings above NIGHT_EXIT_LUMA
+// (the gap is hysteresis so it can't flap). Set NIGHT_MODE 0 to disable. If it
+// flips too eagerly/late for your room, nudge these two numbers.
+#define NIGHT_MODE 1
+#define NIGHT_ENTER_LUMA 50
+#define NIGHT_EXIT_LUMA 140

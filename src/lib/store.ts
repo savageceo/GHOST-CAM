@@ -33,8 +33,8 @@ export function checkDeviceAuth(request: Request): boolean {
 
 // ── control flags (device_state row) ───────────────────────────────────────
 // arm/live/test are the camera's fast-path flags; `orient` (0|180) is the
-// server side of the cloud "Rotate" control. Default 180 corrects the
-// upside-down mount, matching the firmware's compiled default.
+// server side of the cloud "Rotate" control. Default 0 = no sensor flip,
+// matching the firmware's compiled default (CAM_VFLIP/CAM_HMIRROR).
 export type Flags = {
   arm: boolean;
   liveUntil: number;
@@ -45,7 +45,7 @@ export const DEFAULT_FLAGS: Flags = {
   arm: true,
   liveUntil: 0,
   testAt: 0,
-  orient: 180,
+  orient: 0,
 };
 
 export async function readFlags(

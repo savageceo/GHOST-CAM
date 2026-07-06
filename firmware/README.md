@@ -4,33 +4,94 @@ Every device here talks to the same cloud (`API_HOST`) with the same shared
 `DEVICE_TOKEN`. Register once, stream telemetry, done — it shows up on the
 dashboard grid automatically.
 
-## `lab-cam/` — the upgraded XIAO ESP32S3 Sense camera
+## `lab-cam/` — the XIAO ESP32S3 Sense camera (device #1)
+
+**The hardware.** A **Seeed Studio XIAO ESP32S3 Sense**: an ESP32-S3 (dual-core
+240 MHz) with **8 MB PSRAM**, an **OV2640** 2 MP camera (max UXGA 1600×1200,
+native 4:3), a microSD slot, and **2.4 GHz-only** Wi-Fi on a single onboard
+antenna. The PSRAM is what makes full-res JPEG capture possible; the 2.4 GHz
+radio is the ceiling on live frame rate (see the table below).
 
 Everything the old `room-cam` did, plus:
 
-- a **timeline** snapshot every `TIMELINE_SECONDS` (default 60s) → the 24h
-  scrubber + heartbeat,
+- a **live WebSocket stream** to the cloud relay so the away page is
+  near-real-time. While you're watching, the sensor drops to a fast **HD 720p**
+  live size (~10–14 fps) and pushes JPEG frames over `wss://`; when you stop it
+  returns to **UXGA** for crisp stills. Auto-falls back to HTTP frame POSTs
+  (~1.4 fps) if the socket is down.
+- a **timeline** snapshot every `TIMELINE_SECONDS` (default 1s) at full UXGA →
+  the scrubber + timelapse + heartbeat (the cloud keeps ~3h, then prunes),
 - **telemetry** every `TELEMETRY_SECONDS`: chip temp, wifi RSSI, free heap,
   uptime, SD + armed state → live charts,
+- **cloud rotate**: the dashboard's Rotate button flips the image (0/180) on the
+  next poll, persisted to NVS — no reflash,
 - **self-registration** into the device grid on boot.
 
-Build: board **XIAO_ESP32S3**, Tools → **PSRAM: OPI PSRAM** (required).
+### Build & flash
+
+Board **XIAO_ESP32S3**, Tools → **PSRAM: OPI PSRAM** (required). Two libraries —
+Arduino-ESP32 3.x dropped Espressif's `esp_websocket_client`, and its bundled
+JPEG decoder can't read the OV2640's frames:
+
+- **ArduinoWebsockets** (gilmaimon) — the `wss://` live-stream client
+- **JPEGDEC** (bitbank2) — decodes frames for motion detection
 
 ```
+arduino-cli lib install ArduinoWebsockets JPEGDEC
 arduino-cli compile --fqbn 'esp32:esp32:XIAO_ESP32S3:PSRAM=opi' firmware/lab-cam
 arduino-cli upload -p /dev/cu.usbmodem* --fqbn 'esp32:esp32:XIAO_ESP32S3:PSRAM=opi' firmware/lab-cam
 ```
 
-Secrets + tuning live in `lab-cam/config.h` (WiFi, token, cadences, motion
-sensitivity). It reuses your existing WiFi/token/stream-key, so it's a drop-in
-upgrade. Serial at 115200 tells the whole story.
+(Arduino IDE: Library Manager → install "ArduinoWebsockets" and "JPEGDEC".)
+Set `USE_WS_STREAM 0` to skip ArduinoWebsockets and use the slower HTTP-POST live
+path. Secrets + tuning live in `lab-cam/config.h`; it reuses your existing
+WiFi/token/stream-key, so it's a drop-in upgrade. Serial at 115200 tells the
+whole story — `[live] N fps`, `[motion] N% change`, `[sd] …`.
 
-Tuning knobs worth knowing:
+> **XCLK is 20 MHz, on purpose.** The OV2640 clocked at 24 MHz emits oversized,
+> subtly-malformed JPEGs — browsers tolerate them but the on-chip decoders reject
+> them, which silently breaks motion detection (`Error in decoding JPEG image!`).
+> 20 MHz produces clean frames (~6× smaller), so motion works, quality is better,
+> and the live stream is actually *faster*. Don't raise `xclk_freq_hz` back to 24.
 
-- `TIMELINE_SECONDS` — lower = richer timeline, more blob writes. 60s ≈ 1440
-  frames/day.
+### Streaming quality & frame rate
+
+Saved stills (timeline, motion bursts, pins) are **always UXGA 1600×1200** — the
+sharpest the OV2640 does. The **live** view uses a separate, faster resolution so
+you get max-detail stills *and* a smooth live picture. The XIAO's 2.4 GHz Wi-Fi
+sustains only ~2–4 Mbps of JPEG upload, so live resolution trades directly
+against frame rate:
+
+| `LIVE_FRAME_SIZE` | Live res | Typical live fps | Feel |
+| --- | --- | --- | --- |
+| `FRAMESIZE_VGA` | 640×480 | ~20–30 | fastest, softest |
+| `FRAMESIZE_SVGA` | 800×600 | ~16–24 | very smooth |
+| **`FRAMESIZE_HD`** (default) | **1280×720** | **~10–14** | **crisp + smooth (16:9)** |
+| `FRAMESIZE_XGA` | 1024×768 | ~8–12 | more detail, 4:3 |
+| `FRAMESIZE_UXGA` | 1600×1200 | ~4–6 | sharpest, choppy |
+
+Tuning knobs (all in `config.h`, all documented inline):
+
+- `LIVE_FRAME_SIZE` — the live-stream resolution (see table). Default `HD`.
+- `LIVE_JPEG_QUALITY` — live JPEG quality, 10 (best) … 63. Default 11.
+- `LIVE_MIN_INTERVAL_MS` — floor between live frames. **0 = uncapped**, stream as
+  fast as Wi-Fi drains; raise to cap fps / save data (66≈15fps, 100≈10fps).
+- `LIVE_DOWNSCALE` — `1` = the dual-resolution scheme above; `0` = live at the
+  full `FRAME_SIZE` (one resolution for everything). Motion detection pauses
+  while a downscaled live view is active (you're already watching).
+- `FRAME_SIZE` / `JPEG_QUALITY` — the still-capture resolution/quality (UXGA/12).
+- `USE_WS_STREAM` — `1` = WebSocket live (needs ArduinoWebsockets); `0` = HTTP
+  POST fallback (~1.4 fps), no library needed.
+- `TIMELINE_SECONDS` — snapshot cadence. **1s** ≈ a smooth one-second timelapse
+  but ~3600 Blob writes/hr (~86k/day); raise to 2–5 if that's too much.
 - `TELEMETRY_SECONDS` — how often sensor charts update.
 - `MOTION_TRIGGER_PCT` — raise for fewer motion alerts.
+
+> **Getting the best real-world fps:** put the camera on a strong 2.4 GHz signal
+> (RSSI > −60 dBm), close to the AP, on a not-too-crowded channel. Wi-Fi upload —
+> not the sensor or the cloud — is almost always the limit. If HD feels choppy,
+> drop to `FRAMESIZE_SVGA`; if you want more detail and can live with less
+> smoothness, try `FRAMESIZE_XGA`.
 
 ## `lab-node/` — drop-in template for any ESP32
 
