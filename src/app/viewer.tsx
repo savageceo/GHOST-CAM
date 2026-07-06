@@ -226,6 +226,101 @@ function DeviceCard({
   );
 }
 
+// ── motion clip player ────────────────────────────────────────────────────
+// Plays a motion event's frames as a short clip. Preloads them so playback is
+// smooth, with a scrubber and a jump-to-fullscreen link.
+function ClipPlayer({
+  frames,
+  transform,
+}: {
+  frames: string[];
+  transform?: string;
+}) {
+  const [idx, setIdx] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [ready, setReady] = useState(frames.length <= 1);
+
+  useEffect(() => {
+    let alive = true;
+    let loaded = 0;
+    for (const p of frames) {
+      const img = new Image();
+      img.onload = img.onerror = () => {
+        loaded += 1;
+        if (alive && loaded >= frames.length) setReady(true);
+      };
+      img.src = frameUrl(p, "clip");
+    }
+    return () => {
+      alive = false;
+    };
+  }, [frames]);
+
+  useEffect(() => {
+    if (!playing || frames.length < 2) return;
+    const id = setInterval(() => {
+      setIdx((i) => {
+        const next = i + 1;
+        if (next >= frames.length) {
+          setPlaying(false);
+          return frames.length - 1;
+        }
+        return next;
+      });
+    }, 130); // ~7.5 fps playback
+    return () => clearInterval(id);
+  }, [playing, frames.length]);
+
+  const safe = Math.min(idx, frames.length - 1);
+  const cur = frames[safe];
+  return (
+    <div className="clip">
+      <div className="clip-stage">
+        <img
+          src={frameUrl(cur, "clip")}
+          alt="motion clip frame"
+          style={transform ? { transform } : undefined}
+        />
+        <button
+          type="button"
+          className="clip-play"
+          onClick={() => {
+            if (safe >= frames.length - 1) setIdx(0);
+            setPlaying((p) => !p);
+          }}
+          disabled={frames.length < 2}
+        >
+          {playing ? "❚❚" : "▶"}
+        </button>
+        <span className="clip-count">
+          {safe + 1}/{frames.length}
+          {ready ? "" : " · loading"}
+        </span>
+        <a
+          className="clip-full"
+          href={frameUrl(cur, "full")}
+          target="_blank"
+          rel="noreferrer"
+          title="Open frame"
+        >
+          ⤢
+        </a>
+      </div>
+      <input
+        type="range"
+        className="clip-scrub"
+        min={0}
+        max={Math.max(1, frames.length - 1)}
+        value={safe}
+        onChange={(e) => {
+          setPlaying(false);
+          setIdx(Number(e.target.value));
+        }}
+      />
+    </div>
+  );
+}
+
 export default function Viewer() {
   const [status, setStatus] = useState<Status | null>(null);
   const [frameSrc, setFrameSrc] = useState<string | null>(null);
@@ -1153,7 +1248,10 @@ export default function Viewer() {
       {events?.map((event) => (
         <div className="event" key={event.id}>
           <div className="head">
-            <span className="when">{eventLabel(event.id)}</span>
+            <span className="when">
+              {eventLabel(event.id)}
+              <em className="evlen"> · {event.frames.length}f clip</em>
+            </span>
             <div className="evactions">
               <button
                 type="button"
@@ -1175,23 +1273,7 @@ export default function Viewer() {
               </button>
             </div>
           </div>
-          <div className="thumbs">
-            {event.frames.map((path) => (
-              <a
-                key={path}
-                href={frameUrl(path, "full")}
-                target="_blank"
-                rel="noreferrer"
-              >
-                <img
-                  src={frameUrl(path, "thumb")}
-                  alt="motion frame"
-                  loading="lazy"
-                  style={thumbTransform ? { transform: thumbTransform } : undefined}
-                />
-              </a>
-            ))}
-          </div>
+          <ClipPlayer frames={event.frames} transform={thumbTransform} />
         </div>
       ))}
 

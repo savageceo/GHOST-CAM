@@ -91,20 +91,32 @@
 // read the OV2640's JPEGs at all (logs "Error in decoding JPEG image! 6"). 8 =
 // 1/8 (200x150 at UXGA), plenty for motion; smaller = finer but more CPU/PSRAM.
 #define MOTION_SCALE_DIV 8
-#define MOTION_SAMPLE_MS 500
-// A pixel "changed" when its brightness moves more than this (0-255)…
-#define MOTION_PIXEL_DELTA 26
-// …and the frame is motion when more than this % of pixels changed…
-#define MOTION_TRIGGER_PCT 4.0
-// …for this many samples in a row (debounces exposure flicker).
-#define MOTION_CONSEC 2
-// Quiet time between events; continuous motion = one event per cooldown.
-#define MOTION_COOLDOWN_S 90
+// How often to sample for motion. Lower = catches quicker movement.
+#define MOTION_SAMPLE_MS 350
+// A pixel "changed" when its brightness moves more than this (0-255). Lower =
+// more sensitive to subtle movement (and to sensor noise).
+#define MOTION_PIXEL_DELTA 20
+// The frame is "motion" when at least this % of pixels changed — the main
+// sensitivity knob. Lower to trigger on smaller / more distant movement.
+#define MOTION_TRIGGER_PCT 1.8
+// Samples in a row over the threshold before it fires. 1 = trigger on the first
+// (most responsive, catches a quick walk-by); 2 = debounce exposure flicker.
+#define MOTION_CONSEC 1
+// Minimum gap between motion *sessions*. A session self-extends while movement
+// continues (see clip settings below), so this can be short.
+#define MOTION_COOLDOWN_S 6
 // Ignore motion this long after boot (auto-exposure settling).
-#define BOOT_GRACE_S 15
-// Photos per event and spacing between them.
-#define BURST_FRAMES 6
-#define BURST_GAP_MS 1200
+#define BOOT_GRACE_S 12
+
+// ── motion clip recording ────────────────────────────────────────────────────
+// On motion the camera records a CLIP_SECONDS clip at CLIP_FPS, sends ONE alert,
+// then watches RECHECK_SECONDS for more movement — if it continues it records
+// another clip, and so on, up to MAX_CLIPS (a safety cap per session). Each clip
+// becomes its own playable event in the dashboard.
+#define CLIP_SECONDS 15
+#define CLIP_FPS 3
+#define RECHECK_SECONDS 5
+#define MAX_CLIPS 8
 
 // ── microSD archive (optional — works fine with no card) ────────────────────
 #define SD_CS_PIN 21

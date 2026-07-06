@@ -2,9 +2,10 @@
 //
 // Everything room-cam did, plus it now joins the lab as a first-class device:
 //   · live MJPEG stream on the home network:  http://roomcam.local/?k=<key>
-//   · motion detection while armed → burst of BURST_FRAMES photos:
-//       - pushed to the SAVAGE LAB cloud (view + pin from anywhere)
-//       - first photo attached to an ntfy push notification on your phone
+//   · motion detection while armed → records a 15s clip, then keeps recording
+//     15s at a time as long as movement continues (rechecks every 5s):
+//       - streamed to the SAVAGE LAB cloud (each clip a playable event)
+//       - one ntfy + one web push per session, first frame attached
 //       - archived to microSD when a card is present (ring buffer)
 //   · TIMELINE: one snapshot every TIMELINE_SECONDS builds the scrubbable 24h
 //     history on the dashboard and doubles as the heartbeat
@@ -38,13 +39,6 @@
 #include <JPEGDEC.h>  // motion decoder (bitbank2). The core-3.x esp_jpeg/tjpgd
                       // decoder rejects the OV2640's JPEGs (JDR_FMT1); JPEGDEC
                       // decodes them fine. Install: arduino-cli lib install JPEGDEC
-#if USE_WS_STREAM
-// WSS live-relay client. Arduino-ESP32 3.x no longer ships esp_websocket_client,
-// so we use the "ArduinoWebsockets" library (gilmaimon) — install it with:
-//   arduino-cli lib install ArduinoWebsockets
-// or Library Manager → "ArduinoWebsockets".
-#include <ArduinoWebsockets.h>
-#endif
 
 // ── XIAO ESP32S3 Sense pin map ──────────────────────────────────────────
 #define PWDN_GPIO_NUM -1
@@ -74,8 +68,11 @@ static volatile bool armed = ARM_DEFAULT;
 static volatile bool armDirty = false;   // local toggle waiting to reach cloud
 static volatile bool cloudLive = false;  // cloud says someone is watching
 static volatile bool liveCaptureActive = false;  // sensor is in fast live-view mode
-static volatile bool eventRequested = false;
+static volatile bool eventRequested = false;  // a clip session is requested
 static volatile bool eventIsTest = false;
+static volatile bool sessionActive = false;   // a clip session is currently recording
+static volatile int64_t lastMotionMs = 0;     // last sample that saw motion (recheck signal)
+static volatile int64_t lastSessionEndMs = -100000;  // between-session cooldown anchor
 static int64_t lastTestAt = -1;  // -1 until primed by first cloud contact
 static volatile int64_t lastCloudOkMs = -1;
 static volatile int64_t epochMsOffset = 0;  // epoch_ms - boot_ms after NTP
@@ -368,7 +365,7 @@ static void applyFlags(const String &resp) {
     lastTestAt = t;  // prime — an old test press never refires after reboot
   } else if (t > lastTestAt) {
     lastTestAt = t;
-    if (!eventRequested) {
+    if (!eventRequested && !sessionActive) {
       eventIsTest = true;
       eventRequested = true;
     }
@@ -385,11 +382,12 @@ static void applyFlags(const String &resp) {
 // "stop"/"disarm"/"test" without separate polls. Every frame is tagged with
 // this node's DEVICE_ID so the cloud files it under the right device.
 static bool pushFrame(const char *kind, const char *eventId, int seq,
-                      const uint8_t *jpg, size_t len) {
+                      const uint8_t *jpg, size_t len, bool notify = false) {
   String q = String("/api/device/frame?kind=") + kind + "&seq=" + seq +
              "&device=" + DEVICE_ID;
   if (eventId) {
-    q += String("&event=") + eventId;
+    // notify=1 tells the cloud to fire ONE web push (the session's first frame).
+    q += String("&event=") + eventId + "&notify=" + (notify ? "1" : "0");
   } else {
     q += String("&sd=") + (sdOk ? 1 : 0) + "&rssi=" + (int)abs(WiFi.RSSI());
   }
@@ -399,49 +397,15 @@ static bool pushFrame(const char *kind, const char *eventId, int seq,
   return true;
 }
 
-// ── live WebSocket stream (camera → cloud relay) ────────────────────────────
-// Opened only while a viewer is watching; frames fan out via Redis to the page.
-// Stubs when USE_WS_STREAM=0 so the live loop stays identical (HTTP-only).
-#if USE_WS_STREAM
-static websockets::WebsocketsClient wsClient;
-
-// (Re)open the relay socket while a viewer is watching. connect() blocks on the
-// TLS + WS handshake, so we only pay it when disconnected; once up we just
-// poll() to service control frames and notice a server-side close.
-static bool wsEnsureStarted() {
-  if (wsClient.available()) {
-    wsClient.poll();
-    return true;
-  }
-  static char uri[288];
-  snprintf(uri, sizeof(uri),
-           "wss://%s/api/stream/ingest?token=%s&device=%s", API_HOST,
-           DEVICE_TOKEN, DEVICE_ID);
-  wsClient.setInsecure();  // bearer token in the URL carries the trust (as cloudTls)
-  bool ok = wsClient.connect(uri);
-  if (ok) Serial.println("[ws] relay connected");
-  return ok;
+// Live-frame ingest over HTTP → Redis. The camera's HTTP keep-alive client
+// reaches the cloud reliably where its TLS WebSocket client can't; the cloud
+// publishes each frame to Redis and the browser's watch WebSocket delivers it in
+// near-real-time. No Blob/DB on this path, so it's fast — this is the live path.
+static bool streamPush(const uint8_t *jpg, size_t len) {
+  String resp;
+  return cloudCall(true, String("/api/stream/push?device=") + DEVICE_ID, jpg,
+                   len, "image/jpeg", resp);
 }
-
-static void wsStop() {
-  if (wsClient.available()) {
-    wsClient.close();
-    Serial.println("[ws] relay closed (no viewers)");
-  }
-}
-
-// One WebSocket binary message per JPEG. The library masks + frames it; the
-// underlying TLS write blocks when the TCP buffer is full, which is what paces
-// the live loop to the real link rate.
-static bool wsSendFrame(const uint8_t *jpg, size_t len) {
-  if (!wsClient.available()) return false;
-  return wsClient.sendBinary((const char *)jpg, len);
-}
-#else
-static bool wsEnsureStarted() { return false; }
-static void wsStop() {}
-static bool wsSendFrame(const uint8_t *, size_t) { return false; }
-#endif
 
 // ── lab membership: register + telemetry ────────────────────────────────
 static bool registered = false;
@@ -503,35 +467,72 @@ static void ntfyPush(const char *title, const char *message,
   http.end();
 }
 
-// ── motion event: burst → SD + cloud + phone ────────────────────────────
+// ── motion clip session: clip → recheck → repeat while movement continues ────
 
-static void runEvent(bool isTest) {
-  char id[40];
+static void makeEventId(char *id, size_t n) {
   if (epochMsOffset != 0) {
     char iso[24];
     isoFromEpochMs(epochMsOffset + bootMs(), iso, sizeof(iso));
-    snprintf(id, sizeof(id), "e%s", iso);
+    snprintf(id, n, "e%s", iso);  // e2026-07-06T09-13-12Z — dashboard-parseable
   } else {
-    snprintf(id, sizeof(id), "b%lld", (long long)bootMs());
+    snprintf(id, n, "b%lld", (long long)bootMs());
   }
-  Serial.printf("[event] %s %s\n", isTest ? "TEST" : "MOTION", id);
+}
 
-  for (int seq = 0; seq < BURST_FRAMES; seq++) {
-    int64_t slotEnd = bootMs() + BURST_GAP_MS;
-    size_t len = 0;
-    uint8_t *jpg = grabJpeg(&len);
-    if (jpg) {
-      sdSaveFrame(id, seq, jpg, len);
-      if (seq == 0) {
-        ntfyPush(isTest ? "Test alert — camera is watching"
-                        : "Motion in your lab",
-                 nullptr, isTest ? "default" : "high", jpg, len);
+// Record one CLIP_SECONDS clip at CLIP_FPS to SD + cloud. Alerts (ntfy + the
+// cloud web push) fire only on the very first frame of the session. After each
+// clip we watch RECHECK_SECONDS for continued movement (motionTask keeps
+// sampling and stamps lastMotionMs); if it's still moving we record another,
+// up to MAX_CLIPS. Each clip is its own dashboard event.
+static void runMotionSession(bool isTest) {
+  Serial.printf("[event] SESSION start (%s)\n", isTest ? "TEST" : "MOTION");
+  const int64_t frameGap = 1000 / (CLIP_FPS < 1 ? 1 : CLIP_FPS);
+  bool firstFrame = true;
+  int clips = 0;
+  for (;;) {
+    char id[40];
+    makeEventId(id, sizeof(id));  // each clip is timestamped when it starts
+    int64_t clipEnd = bootMs() + (int64_t)CLIP_SECONDS * 1000;
+    int seq = 0;
+    Serial.printf("[event] clip %d %s (%ds @ %dfps)\n", clips + 1, id,
+                  CLIP_SECONDS, CLIP_FPS);
+    while (bootMs() < clipEnd) {
+      int64_t next = bootMs() + frameGap;
+      size_t len = 0;
+      uint8_t *jpg = grabJpeg(&len);
+      if (jpg) {
+        sdSaveFrame(id, seq, jpg, len);
+        if (firstFrame) {
+          ntfyPush(isTest ? "Test alert — camera is watching"
+                          : "Motion in your lab",
+                   nullptr, isTest ? "default" : "high", jpg, len);
+        }
+        pushFrame("motion", id, seq, jpg, len, firstFrame);  // notify once
+        firstFrame = false;
+        seq++;
+        free(jpg);
       }
-      pushFrame("motion", id, seq, jpg, len);
-      free(jpg);
+      int64_t wait = next - bootMs();
+      if (wait > 0) vTaskDelay(pdMS_TO_TICKS(wait));
     }
-    int64_t wait = slotEnd - bootMs();
-    if (wait > 0) vTaskDelay(pdMS_TO_TICKS(wait));
+    clips++;
+    Serial.printf("[event] clip %d done — %d frames\n", clips, seq);
+    if (isTest || clips >= MAX_CLIPS) break;
+    // Watch for continued movement; motionTask stamps lastMotionMs each hit.
+    int64_t recheckStart = bootMs();
+    bool cont = false;
+    while (bootMs() - recheckStart < (int64_t)RECHECK_SECONDS * 1000) {
+      if (lastMotionMs >= recheckStart) {
+        cont = true;
+        break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(120));
+    }
+    if (!cont) {
+      Serial.println("[event] quiet — session end");
+      break;
+    }
+    Serial.println("[event] still moving — another clip");
   }
   ensureSdSpace();
 }
@@ -584,11 +585,10 @@ static void motionTask(void *) {
   Serial.printf("[motion] detector on — %dx%d @ 1/%d\n", w, h, MOTION_SCALE_DIV);
   bool havePrev = false;
   int hits = 0;
-  int64_t lastEventMs = -(int64_t)MOTION_COOLDOWN_S * 1000;
 
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(MOTION_SAMPLE_MS));
-    if (!camOk || eventRequested) continue;
+    if (!camOk) continue;  // keep sampling during a session so recheck sees motion
 #if LIVE_DOWNSCALE
     // Live-view runs the sensor at a different geometry than these buffers, and
     // someone's already watching — pause detection and re-prime when live ends.
@@ -643,22 +643,24 @@ static void motionTask(void *) {
         if (d > MOTION_PIXEL_DELTA) changed++;
       }
       float pct = 100.0f * changed / n;
-      // Proof-of-life + tuning aid: log the current motion level every ~10s.
+      bool moving = pct >= MOTION_TRIGGER_PCT;
+      if (moving) lastMotionMs = bootMs();  // recheck signal for the clip session
+      // Log notable samples (near/over threshold) + a 10s idle heartbeat — makes
+      // tuning MOTION_TRIGGER_PCT easy: watch the % as you walk past.
       static int64_t lastMotionLog = 0;
-      if (bootMs() - lastMotionLog > 10000) {
+      if (moving || bootMs() - lastMotionLog > 10000) {
         lastMotionLog = bootMs();
-        Serial.printf("[motion] %.1f%% change (armed=%s)\n", pct,
-                      armed ? "yes" : "no");
+        Serial.printf("[motion] %.1f%% (armed=%s%s)\n", pct, armed ? "yes" : "no",
+                      sessionActive ? ", recording" : "");
       }
-      hits = (pct >= MOTION_TRIGGER_PCT) ? hits + 1 : 0;
-      if (hits >= MOTION_CONSEC && armed && !eventRequested &&
+      hits = moving ? hits + 1 : 0;
+      if (hits >= MOTION_CONSEC && armed && !eventRequested && !sessionActive &&
           bootMs() > (int64_t)BOOT_GRACE_S * 1000 &&
-          bootMs() - lastEventMs > (int64_t)MOTION_COOLDOWN_S * 1000) {
-        lastEventMs = bootMs();
+          bootMs() - lastSessionEndMs > (int64_t)MOTION_COOLDOWN_S * 1000) {
         hits = 0;
         eventIsTest = false;
         eventRequested = true;
-        Serial.printf("[motion] triggered — %.1f%% of pixels moved\n", pct);
+        Serial.printf("[motion] TRIGGER %.1f%% → starting clip session\n", pct);
       }
     }
     uint8_t *tmp = prev;
@@ -885,7 +887,6 @@ static void netTask(void *) {
   int64_t lastTlFrame = -(int64_t)TIMELINE_SECONDS * 1000;
   int64_t lastTelemetry = -(int64_t)TELEMETRY_SECONDS * 1000;
   int64_t lastLiveFrame = 0;
-  int liveSeq = 0;
   int64_t fpsWindowMs = 0;  // live-fps report window (serial diagnostic)
   int fpsCount = 0;
 
@@ -924,20 +925,22 @@ static void netTask(void *) {
     }
 
     if (eventRequested) {
-      runEvent(eventIsTest);
       eventRequested = false;
+      sessionActive = true;
+      runMotionSession(eventIsTest);
+      sessionActive = false;
+      lastSessionEndMs = bootMs();
       continue;
     }
 
     if (cloudLive) {
-      bool ws = wsEnsureStarted();
       if (!liveCaptureActive) {  // entering live → pause motion, then downscale
         liveCaptureActive = true;
         applyCaptureMode(true);
         fpsWindowMs = bootMs();
         fpsCount = 0;
       }
-      // Keep hearing stop/disarm/test/rotate even while streaming over the WS.
+      // Keep hearing stop/disarm/test/rotate while streaming.
       if (bootMs() - lastPoll >= (int64_t)POLL_SECONDS * 1000) {
         lastPoll = bootMs();
         String resp;
@@ -945,38 +948,33 @@ static void netTask(void *) {
           applyFlags(resp);
         }
       }
-      // Over the socket: stream as fast as WiFi drains — wsSendFrame() blocks
-      // when the tx buffer is full, so it self-paces at the true link rate;
-      // LIVE_MIN_INTERVAL_MS is only a floor. HTTP fallback stays paced.
-      if (bootMs() - lastLiveFrame >=
-          (ws ? (int64_t)LIVE_MIN_INTERVAL_MS : (int64_t)LIVE_FRAME_MS)) {
+      // Stream frames as fast as the HTTP round-trip allows — streamPush() blocks
+      // on the POST, so it self-paces at the true link rate; LIVE_MIN_INTERVAL_MS
+      // is only a floor. The browser's watch WebSocket delivers them live.
+      if (bootMs() - lastLiveFrame >= (int64_t)LIVE_MIN_INTERVAL_MS) {
         lastLiveFrame = bootMs();
         size_t len = 0;
         uint8_t *jpg = grabJpeg(&len);
         if (jpg) {
-          if (!(ws && wsSendFrame(jpg, len))) {
-            pushFrame("live", nullptr, liveSeq++, jpg, len);
-          }
+          streamPush(jpg, len);
           free(jpg);
           lastTlFrame = bootMs();  // timeline pauses while live is on
           fpsCount++;
         }
       }
       if (bootMs() - fpsWindowMs >= 5000) {  // report live fps on serial for tuning
-        Serial.printf("[live] %.1f fps over %s\n",
-                      fpsCount * 1000.0 / (bootMs() - fpsWindowMs),
-                      ws ? "websocket" : "http");
+        Serial.printf("[live] %.1f fps (http→redis)\n",
+                      fpsCount * 1000.0 / (bootMs() - fpsWindowMs));
         fpsWindowMs = bootMs();
         fpsCount = 0;
       }
-      vTaskDelay(pdMS_TO_TICKS(ws ? 3 : 20));  // tiny yield; the send self-paces
+      vTaskDelay(pdMS_TO_TICKS(3));
       continue;
     }
     if (liveCaptureActive) {  // leaving live → restore UXGA stills
       applyCaptureMode(false);
       liveCaptureActive = false;
     }
-    wsStop();  // no viewers → drop the socket
 
     if (bootMs() - lastPoll >= (int64_t)POLL_SECONDS * 1000) {
       lastPoll = bootMs();

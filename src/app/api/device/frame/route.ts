@@ -93,8 +93,14 @@ export async function POST(request: Request) {
       try {
         await recordFrame(device, "motion", now, path, { sd, rssi: cleanRssi });
       } catch {}
-      // Native Web Push to the installed PWA(s) with the snapshot attached.
-      // Fire-and-forget via waitUntil so the camera's POST returns immediately.
+    }
+    // One Web Push per motion session. New firmware sets notify=1 on the very
+    // first frame of a session (and notify=0 after); older firmware sends no
+    // notify param, so fall back to seq 0 to stay compatible.
+    const notifyParam = searchParams.get("notify");
+    const shouldNotify =
+      notifyParam === "1" || (notifyParam === null && motionSeq === 0);
+    if (shouldNotify) {
       try {
         const image = await signedUrlFor(path);
         waitUntil(

@@ -29,46 +29,49 @@ Everything the old `room-cam` did, plus:
 
 ### Build & flash
 
-Board **XIAO_ESP32S3**, Tools → **PSRAM: OPI PSRAM** (required). Two libraries —
-Arduino-ESP32 3.x dropped Espressif's `esp_websocket_client`, and its bundled
-JPEG decoder can't read the OV2640's frames:
-
-- **ArduinoWebsockets** (gilmaimon) — the `wss://` live-stream client
-- **JPEGDEC** (bitbank2) — decodes frames for motion detection
+Board **XIAO_ESP32S3**, Tools → **PSRAM: OPI PSRAM** (required). One library —
+**JPEGDEC** (bitbank2) — because Arduino-ESP32 3.x's bundled JPEG decoder can't
+read the OV2640's frames (needed for motion detection):
 
 ```
-arduino-cli lib install ArduinoWebsockets JPEGDEC
+arduino-cli lib install JPEGDEC
 arduino-cli compile --fqbn 'esp32:esp32:XIAO_ESP32S3:PSRAM=opi' firmware/lab-cam
 arduino-cli upload -p /dev/cu.usbmodem* --fqbn 'esp32:esp32:XIAO_ESP32S3:PSRAM=opi' firmware/lab-cam
 ```
 
-(Arduino IDE: Library Manager → install "ArduinoWebsockets" and "JPEGDEC".)
-Set `USE_WS_STREAM 0` to skip ArduinoWebsockets and use the slower HTTP-POST live
-path. Secrets + tuning live in `lab-cam/config.h`; it reuses your existing
-WiFi/token/stream-key, so it's a drop-in upgrade. Serial at 115200 tells the
-whole story — `[live] N fps`, `[motion] N% change`, `[sd] …`.
+(Arduino IDE: Library Manager → install "JPEGDEC".) Secrets + tuning live in
+`lab-cam/config.h`; it reuses your existing WiFi/token/stream-key, so it's a
+drop-in upgrade. Serial at 115200 tells the whole story — `[live] N fps`,
+`[motion] N% change`, `[sd] …`.
 
 > **XCLK is 20 MHz, on purpose.** The OV2640 clocked at 24 MHz emits oversized,
 > subtly-malformed JPEGs — browsers tolerate them but the on-chip decoders reject
 > them, which silently breaks motion detection (`Error in decoding JPEG image!`).
 > 20 MHz produces clean frames (~6× smaller), so motion works, quality is better,
-> and the live stream is actually *faster*. Don't raise `xclk_freq_hz` back to 24.
+> and the live stream is faster. Don't raise `xclk_freq_hz` back to 24.
+
+> **Live transport.** The camera streams live frames over plain HTTP POST to
+> `/api/stream/push`, which republishes them to Redis; the browser receives them
+> over a WebSocket. (The ESP32's own TLS WebSocket client can't reliably open a
+> second TLS connection to Vercel alongside the HTTP keep-alive, so the reliable
+> HTTP path wins.) Frame rate is set by resolution/quality — see the table above.
 
 ### Streaming quality & frame rate
 
 Saved stills (timeline, motion bursts, pins) are **always UXGA 1600×1200** — the
 sharpest the OV2640 does. The **live** view uses a separate, faster resolution so
-you get max-detail stills *and* a smooth live picture. The XIAO's 2.4 GHz Wi-Fi
-sustains only ~2–4 Mbps of JPEG upload, so live resolution trades directly
-against frame rate:
+you get max-detail stills *and* a smoother live picture. Live frames go out one
+HTTP POST at a time, so the frame rate is capped by the **round-trip to the cloud**
+(~150–200 ms each) more than by resolution — smaller frames help a little, not a
+lot. Measured over a decent connection:
 
 | `LIVE_FRAME_SIZE` | Live res | Typical live fps | Feel |
 | --- | --- | --- | --- |
-| `FRAMESIZE_VGA` | 640×480 | ~20–30 | fastest, softest |
-| `FRAMESIZE_SVGA` | 800×600 | ~16–24 | very smooth |
-| **`FRAMESIZE_HD`** (default) | **1280×720** | **~10–14** | **crisp + smooth (16:9)** |
-| `FRAMESIZE_XGA` | 1024×768 | ~8–12 | more detail, 4:3 |
-| `FRAMESIZE_UXGA` | 1600×1200 | ~4–6 | sharpest, choppy |
+| `FRAMESIZE_VGA` | 640×480 | ~6–8 | fastest, softest |
+| `FRAMESIZE_SVGA` | 800×600 | ~5–7 | smooth |
+| **`FRAMESIZE_HD`** (default) | **1280×720** | **~4–6** | **crisp (16:9)** |
+| `FRAMESIZE_XGA` | 1024×768 | ~4–5 | more detail, 4:3 |
+| `FRAMESIZE_UXGA` | 1600×1200 | ~2–4 | sharpest, slowest |
 
 Tuning knobs (all in `config.h`, all documented inline):
 
