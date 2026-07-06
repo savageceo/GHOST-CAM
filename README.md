@@ -99,6 +99,8 @@ The camera picks up the new arm state on its next poll (≤ `POLL_SECONDS`). End
 flag the dashboard's Armed button uses. Motion bursts then land in the cloud +
 ntfy + microSD exactly as when armed by hand.
 
+**→ Full step-by-step walkthrough: [`docs/iphone-auto-arm.md`](docs/iphone-auto-arm.md).**
+
 ## Data model
 
 **Neon — index / state / control plane** (`src/lib/db/schema.ts`):
