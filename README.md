@@ -5,10 +5,12 @@ room-watch bones. The XIAO ESP32S3 Sense in the printed case is device #1; the
 system is a **multi-device lab hub** that any ESP32 gadget (LilyGo T-Embed
 CC1101, NRF bridges, bare sensors) can join with a few lines of code.
 
-Live at **https://room-watch-six.vercel.app** — log in with the password held in
-the `STORAGE_PASSWORD` env var. The camera needs **no reflash** to keep working;
-flash the `lab-cam` firmware when convenient for the live WebSocket stream, 1s
-timeline, telemetry, and cloud rotate.
+Live at **https://www.ghostk.ing** (also `room-watch-six.vercel.app`) — log in
+with the password held in the `STORAGE_PASSWORD` env var.
+
+> **Current state, gotchas, and what's left to do: [`docs/BUILD-NOTES.md`](docs/BUILD-NOTES.md).**
+> Guides: [install + push alerts](docs/install-and-alerts.md) ·
+> [iPhone auto-arm](docs/iphone-auto-arm.md).
 
 ## Architecture at a glance
 

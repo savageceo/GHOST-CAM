@@ -343,8 +343,17 @@ static void applyNightMode(bool night) {
   sensor_t *s = esp_camera_sensor_get();
   if (!s) return;
   s->set_gainceiling(s, night ? GAINCEILING_128X : GAINCEILING_32X);
-  s->set_ae_level(s, night ? 2 : 0);
   s->set_brightness(s, night ? 2 : 1);
+  if (night) {
+    // Backlit / dark rooms: auto-exposure meters the bright window and crushes
+    // the interior to black. Force a long manual exposure so the ROOM is visible
+    // (the window blows out) — that's what makes indoor motion detectable.
+    s->set_exposure_ctrl(s, 0);  // AEC off
+    s->set_aec_value(s, NIGHT_EXPOSURE);
+  } else {
+    s->set_exposure_ctrl(s, 1);  // AEC back on
+    s->set_ae_level(s, 0);
+  }
   Serial.printf("[cam] night mode %s\n", night ? "ON" : "off");
 }
 #endif
@@ -588,23 +597,24 @@ static void motionTask(void *) {
 
   for (;;) {
     vTaskDelay(pdMS_TO_TICKS(MOTION_SAMPLE_MS));
-    if (!camOk) continue;  // keep sampling during a session so recheck sees motion
-#if LIVE_DOWNSCALE
-    // Live-view runs the sensor at a different geometry than these buffers, and
-    // someone's already watching — pause detection and re-prime when live ends.
-    if (liveCaptureActive) {
-      havePrev = false;
-      continue;
-    }
-#endif
+    if (!camOk) continue;  // runs even during live now — motion never pauses
     size_t len = 0;
     uint8_t *jpg = grabJpeg(&len);
     if (!jpg) continue;
-    // Decode straight to 8-bit grayscale at 1/MOTION_SCALE_DIV into `cur`.
+    // Decode to a brightness map. The sensor size changes between idle (UXGA) and
+    // live (HD), so track the actual decoded dims and re-prime on a change; the
+    // buffers are sized for the largest case, so a smaller live frame still fits.
     g_bright = cur;
     bool decoded = false;
     int derr = 0;
     if (jpeg.openRAM(jpg, (int)len, motionDraw)) {
+      int ow = jpeg.getWidth() / MOTION_SCALE_DIV;
+      int oh = jpeg.getHeight() / MOTION_SCALE_DIV;
+      if (ow > 0 && oh > 0 && ow * oh <= n && (ow != g_bw || oh != g_bh)) {
+        g_bw = ow;
+        g_bh = oh;
+        havePrev = false;  // geometry changed (live start/stop) → can't diff
+      }
       jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
       decoded = (jpeg.decode(0, 0, scaleOpt) == 1);
       derr = jpeg.getLastError();
@@ -622,12 +632,13 @@ static void motionTask(void *) {
       }
       continue;
     }
+    const int curN = g_bw * g_bh;  // actual pixels this frame (varies idle vs live)
 
 #if NIGHT_MODE
     {  // auto day/night from average scene brightness (hysteresis band)
       long sum = 0;
-      for (int i = 0; i < n; i++) sum += cur[i];
-      float avg = (float)sum / n;
+      for (int i = 0; i < curN; i++) sum += cur[i];
+      float avg = (float)sum / curN;
       static float lumaEma = -1;
       lumaEma = (lumaEma < 0) ? avg : (lumaEma * 0.95f + avg * 0.05f);
       applyNightMode(nightActive ? (lumaEma < NIGHT_EXIT_LUMA)
@@ -637,21 +648,27 @@ static void motionTask(void *) {
 
     if (havePrev) {
       int changed = 0;
-      for (int i = 0; i < n; i++) {
+      for (int i = 0; i < curN; i++) {
         int d = (int)cur[i] - (int)prev[i];
         if (d < 0) d = -d;
         if (d > MOTION_PIXEL_DELTA) changed++;
       }
-      float pct = 100.0f * changed / n;
+      float pct = 100.0f * changed / curN;
       bool moving = pct >= MOTION_TRIGGER_PCT;
       if (moving) lastMotionMs = bootMs();  // recheck signal for the clip session
-      // Log notable samples (near/over threshold) + a 10s idle heartbeat — makes
-      // tuning MOTION_TRIGGER_PCT easy: watch the % as you walk past.
+      // Log on motion, plus a ~20s heartbeat with the PEAK % since the last line
+      // (so brief motion still shows) and avg scene brightness — for tuning.
       static int64_t lastMotionLog = 0;
-      if (moving || bootMs() - lastMotionLog > 10000) {
+      static float peakPct = 0;
+      if (pct > peakPct) peakPct = pct;
+      if (moving || bootMs() - lastMotionLog > 20000) {
+        long sum = 0;
+        for (int i = 0; i < curN; i++) sum += cur[i];
+        Serial.printf("[motion] now=%.1f%% peak=%.1f%% avg=%ld (armed=%s%s)\n",
+                      pct, peakPct, sum / curN, armed ? "yes" : "no",
+                      sessionActive ? ", rec" : "");
         lastMotionLog = bootMs();
-        Serial.printf("[motion] %.1f%% (armed=%s%s)\n", pct, armed ? "yes" : "no",
-                      sessionActive ? ", recording" : "");
+        peakPct = 0;
       }
       hits = moving ? hits + 1 : 0;
       if (hits >= MOTION_CONSEC && armed && !eventRequested && !sessionActive &&
