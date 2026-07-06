@@ -33,6 +33,25 @@ const IDLE_POLL_MS = 8000;
 const OFFLINE_AFTER_MS = 6.5 * 60 * 1000;
 const DEVICE_ONLINE_MS = 3 * 60 * 1000;
 const CAMERA_ID = "roomcam";
+const VAPID_PUBLIC_KEY = process.env.NEXT_PUBLIC_VAPID_PUBLIC_KEY ?? "";
+
+// VAPID keys are URL-safe base64; PushManager wants the raw bytes.
+function urlB64ToUint8Array(base64: string): Uint8Array {
+  const pad = "=".repeat((4 - (base64.length % 4)) % 4);
+  const b64 = (base64 + pad).replace(/-/g, "+").replace(/_/g, "/");
+  const raw = atob(b64);
+  const out = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i += 1) out[i] = raw.charCodeAt(i);
+  return out;
+}
+
+type NotifState =
+  | "idle" // supported, not yet enabled
+  | "on" // subscribed
+  | "blocked" // permission denied
+  | "unsupported" // no push support / no key
+  | "need-install" // iOS: must Add to Home Screen first
+  | "busy";
 
 const METRIC_INFO: Record<
   string,
@@ -227,6 +246,8 @@ export default function Viewer() {
   const [orient, setOrient] = useState(0); // display rotation (deg): instant, pre-reflash fix
   const [wantLive, setWantLive] = useState(false); // WebSocket live stream requested
   const [livePainting, setLivePainting] = useState(false); // live WS frames on screen
+  const [notif, setNotif] = useState<NotifState>("idle"); // push-notification status
+  const [cinema, setCinema] = useState(false); // fullscreen live "box"
 
   const skewRef = useRef(0);
   const liveWantedRef = useRef(false);
@@ -412,6 +433,81 @@ export default function Viewer() {
       return next;
     });
   }, []);
+
+  // ── push notifications (installed PWA) ──────────────────────────────────────
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const supported =
+      "serviceWorker" in navigator &&
+      "PushManager" in window &&
+      "Notification" in window &&
+      !!VAPID_PUBLIC_KEY;
+    if (!supported) return setNotif("unsupported");
+    if (Notification.permission === "denied") return setNotif("blocked");
+    navigator.serviceWorker
+      .register("/sw.js")
+      .then((reg) => reg.pushManager.getSubscription())
+      .then((sub) => {
+        if (sub && Notification.permission === "granted") setNotif("on");
+      })
+      .catch(() => {});
+  }, []);
+
+  const enableAlerts = useCallback(async () => {
+    const standalone =
+      window.matchMedia("(display-mode: standalone)").matches ||
+      (navigator as unknown as { standalone?: boolean }).standalone === true;
+    const isIos = /iphone|ipad|ipod/i.test(navigator.userAgent);
+    if (isIos && !standalone) return setNotif("need-install");
+    setNotif("busy");
+    try {
+      const reg =
+        (await navigator.serviceWorker.getRegistration()) ??
+        (await navigator.serviceWorker.register("/sw.js"));
+      await navigator.serviceWorker.ready;
+      const perm = await Notification.requestPermission();
+      if (perm !== "granted") return setNotif(perm === "denied" ? "blocked" : "idle");
+      let sub = await reg.pushManager.getSubscription();
+      if (!sub) {
+        sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlB64ToUint8Array(VAPID_PUBLIC_KEY) as BufferSource,
+        });
+      }
+      const res = await fetch("/api/push/subscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ subscription: sub.toJSON() }),
+      });
+      if (!res.ok) throw new Error("subscribe failed");
+      setNotif("on");
+      flashMsg("Motion alerts on — you'll get a push when something moves ✓");
+    } catch {
+      setNotif("idle");
+      setErr("couldn't enable alerts — try again.");
+    }
+  }, [flashMsg]);
+
+  const sendTestPush = useCallback(async () => {
+    try {
+      const res = await fetch("/api/push/test", { method: "POST" });
+      const j = (await res.json()) as { sent?: number };
+      flashMsg(
+        j.sent && j.sent > 0
+          ? `Test push sent to ${j.sent} device${j.sent > 1 ? "s" : ""} ✓`
+          : "No subscribed devices yet.",
+      );
+    } catch {
+      setErr("couldn't send test push.");
+    }
+  }, [flashMsg]);
+
+  const alertsClick = useCallback(() => {
+    if (notif === "on") sendTestPush();
+    else if (notif === "blocked")
+      setErr("alerts are blocked — turn on notifications for this app in Settings.");
+    else enableAlerts();
+  }, [notif, sendTestPush, enableAlerts]);
 
   // Live WebSocket stream: when live is requested, subscribe to the relay and
   // paint incoming JPEG frames straight onto the hero (near-real-time). If the
@@ -759,7 +855,7 @@ export default function Viewer() {
       {flash && <div className="flash">{flash}</div>}
 
       <section className="hero">
-        <div className="frame">
+        <div className={`frame${cinema ? " cinema" : ""}`}>
           <img
             ref={heroImgRef}
             alt="lab camera"
@@ -808,6 +904,16 @@ export default function Viewer() {
               title="Rotate view"
             >
               ⟳{orient ? ` ${orient}°` : ""}
+            </button>
+          )}
+          {hasImage && (
+            <button
+              type="button"
+              className="cinebtn"
+              onClick={() => setCinema((c) => !c)}
+              title={cinema ? "Exit fullscreen" : "Fullscreen live"}
+            >
+              {cinema ? "✕" : "⛶"}
             </button>
           )}
           {reviewing && (
@@ -927,6 +1033,15 @@ export default function Viewer() {
         </button>
       </div>
       {err && <p className="err">{err}</p>}
+
+      {(notif === "idle" || notif === "need-install") && (
+        <button type="button" className="alertcta" onClick={alertsClick}>
+          🔔{" "}
+          {notif === "need-install"
+            ? "On iPhone: Share → Add to Home Screen, open that app, then tap here to arm motion alerts"
+            : "Turn on motion push notifications"}
+        </button>
+      )}
 
       <div className="section">
         <h2>Devices</h2>
@@ -1120,7 +1235,19 @@ export default function Viewer() {
       )}
 
       <p className="note">
-        1s timeline · last hour · pins kept forever · armed = motion alerts on ·{" "}
+        1s timeline · last hour · pins kept forever ·{" "}
+        {notif !== "unsupported" && (
+          <>
+            <button type="button" className="linky" onClick={alertsClick}>
+              {notif === "on"
+                ? "🔔 alerts on · test"
+                : notif === "blocked"
+                  ? "🔔 alerts blocked"
+                  : "🔔 enable alerts"}
+            </button>{" "}
+            ·{" "}
+          </>
+        )}
         <button type="button" className="linky" onClick={logout}>
           lock
         </button>

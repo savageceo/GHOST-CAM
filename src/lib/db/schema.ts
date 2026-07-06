@@ -110,6 +110,19 @@ export const pins = pgTable("pins", {
   at: timestamp("at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+// Web Push subscriptions (the PWA's home-screen install → native motion alerts).
+// One row per browser/device push endpoint; `p256dh`/`auth` are the encryption
+// keys web-push needs. Pruned when a push comes back 404/410 (unsubscribed).
+export const pushSubscriptions = pgTable("push_subscriptions", {
+  endpoint: text("endpoint").primaryKey(),
+  p256dh: text("p256dh").notNull(),
+  auth: text("auth").notNull(),
+  ua: text("ua"),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+});
+
 // Phase-2 tables (people / face_embeddings / sightings, pgvector) land with the
 // people milestone; the `pgvector` extension is enabled at migration time so
 // they drop in cleanly.

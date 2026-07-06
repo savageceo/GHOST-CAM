@@ -788,3 +788,73 @@ body {
 .gate button:disabled {
   opacity: 0.5;
 }
+
+/* ── motion-alert call to action ──────────────────────────────────────────── */
+.alertcta {
+  display: block;
+  width: 100%;
+  margin: 4px 0 2px;
+  padding: 13px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(56, 189, 248, 0.4);
+  background: linear-gradient(
+    180deg,
+    rgba(56, 189, 248, 0.15),
+    rgba(56, 189, 248, 0.06)
+  );
+  color: #cfeffe;
+  font-size: 14px;
+  font-weight: 600;
+  text-align: center;
+  cursor: pointer;
+}
+.alertcta:active {
+  transform: scale(0.99);
+}
+
+/* ── fullscreen live "box" (cinema mode) ──────────────────────────────────── */
+.cinebtn {
+  position: absolute;
+  right: 10px;
+  top: 52px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(4px);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  border-radius: 9px;
+  padding: 7px 10px;
+  cursor: pointer;
+}
+.cinebtn:active {
+  transform: scale(0.96);
+}
+.frame.cinema {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  border: 0;
+  border-radius: 0;
+  aspect-ratio: auto;
+  background: #000;
+}
+.frame.cinema img {
+  object-fit: contain;
+}
+.frame.cinema .cinebtn {
+  position: fixed;
+  top: max(14px, env(safe-area-inset-top, 0px));
+  right: max(16px, env(safe-area-inset-right, 0px));
+  z-index: 201;
+  font-size: 18px;
+  padding: 9px 15px;
+}
+.frame.cinema .stamp {
+  left: max(14px, env(safe-area-inset-left, 0px));
+  bottom: max(14px, env(safe-area-inset-bottom, 0px));
+}
+.frame.cinema .pinbtn {
+  z-index: 201;
+}

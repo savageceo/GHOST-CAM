@@ -1,4 +1,5 @@
 import { put } from "@vercel/blob";
+import { waitUntil } from "@vercel/functions";
 import {
   BLOB_ACCESS,
   checkDeviceAuth,
@@ -7,7 +8,9 @@ import {
   pruneLiveFrames,
   readFlags,
   recordMotionFrame,
+  signedUrlFor,
 } from "@/lib/store";
+import { sendPushToAll } from "@/lib/push";
 import {
   CAMERA_DEVICE_ID,
   pruneTimeline,
@@ -89,6 +92,20 @@ export async function POST(request: Request) {
     if (motionSeq === 0) {
       try {
         await recordFrame(device, "motion", now, path, { sd, rssi: cleanRssi });
+      } catch {}
+      // Native Web Push to the installed PWA(s) with the snapshot attached.
+      // Fire-and-forget via waitUntil so the camera's POST returns immediately.
+      try {
+        const image = await signedUrlFor(path);
+        waitUntil(
+          sendPushToAll({
+            title: "🚨 Motion in your lab",
+            body: "Tap to watch the live camera.",
+            url: "/",
+            image,
+            tag: "motion",
+          }),
+        );
       } catch {}
     }
   } else {

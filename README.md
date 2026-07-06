@@ -77,9 +77,14 @@ XIAO — say so and it's a small firmware fork.)
 
 ## iPhone setup
 
-1. Open **https://room-watch-six.vercel.app**, enter the `STORAGE_PASSWORD`,
-   Share → **Add to Home Screen**.
-2. Alerts: **ntfy** app → subscribe to your `NTFY_TOPIC` (set in firmware).
+1. Open **https://room-watch-six.vercel.app**, log in, then Share → **Add to
+   Home Screen**. The installed app runs full-screen (it's a PWA) and unlocks
+   **native push notifications** — turn them on with **🔔 Turn on motion push
+   notifications** inside the app. Tap **⛶** on the camera for a full-screen live
+   box. Full walkthrough: [`docs/install-and-alerts.md`](docs/install-and-alerts.md).
+2. Motion alerts land two ways: the in-app **Web Push** above (snapshot + tap →
+   live view), and/or the **ntfy** app subscribed to your `NTFY_TOPIC` (fired
+   straight from the camera even if the cloud is down).
 3. Home stream (LAN): **http://roomcam.local/?k=<STREAM_KEY>**.
 
 ### Auto-arm when you leave (iPhone geofence)
