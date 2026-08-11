@@ -1,25 +1,11 @@
-import { checkDeviceAuth, readFlags, writeFlags } from "@/lib/store";
-
-function deviceView(flags: {
-  arm: boolean;
-  liveUntil: number;
-  testAt: number;
-  orient: number;
-}) {
-  return {
-    arm: flags.arm,
-    live: flags.liveUntil > Date.now(),
-    testAt: flags.testAt,
-    orient: flags.orient,
-  };
-}
+import { checkDeviceAuth, deviceFlagView, readFlags, writeFlags } from "@/lib/store";
 
 // Camera asks "what should I be doing?" every few seconds while idle.
 export async function GET(request: Request) {
   if (!checkDeviceAuth(request)) {
     return Response.json({ error: "unauthorized" }, { status: 401 });
   }
-  return Response.json(deviceView(await readFlags()));
+  return Response.json(deviceFlagView(await readFlags()));
 }
 
 // Camera reports an arm/disarm made on its local page, so the cloud flag
@@ -39,5 +25,5 @@ export async function POST(request: Request) {
   }
   const flags = await readFlags();
   if (flags.arm !== arm) await writeFlags({ ...flags, arm });
-  return Response.json(deviceView({ ...flags, arm }));
+  return Response.json(deviceFlagView({ ...flags, arm }));
 }

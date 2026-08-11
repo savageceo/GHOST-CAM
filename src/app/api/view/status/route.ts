@@ -13,6 +13,8 @@ export async function GET() {
     {
       arm: flags.arm,
       liveUntil: flags.liveUntil,
+      tlSec: flags.tlSec,
+      bts: flags.bts,
       now: Date.now(),
       newest,
     },

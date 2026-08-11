@@ -39,6 +39,23 @@ static void readSensors(lab::Metrics &m) {
   //   m.add("doorOpen", digitalRead(4) == HIGH);
 }
 
+// ALARMS: telemetry charts trends; lab::event() pings the phone NOW (with the
+// camera's latest frame attached). Call it on the edge you care about, e.g. in
+// loop():
+//
+//   static bool wasOpen = false;
+//   bool open = digitalRead(REED_PIN) == HIGH;          // reed contact + magnet
+//   if (open && !wasOpen) lab::event(DEVICE_ID, "door", "front door");
+//   wasOpen = open;
+//
+//   if (digitalRead(BEAM_PIN) == LOW)                    // KY-008 laser broken
+//     lab::event(DEVICE_ID, "trip", "entry beam");
+//
+//   if (digitalRead(BTN_PIN) == LOW)                     // panic button
+//     lab::event(DEVICE_ID, "panic", "panic button");
+//
+// Debounce/cooldown to taste — one event per real-world happening.
+
 void setup() {
   Serial.begin(115200);
   delay(300);

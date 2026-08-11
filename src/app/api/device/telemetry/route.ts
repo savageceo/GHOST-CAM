@@ -1,4 +1,4 @@
-import { checkDeviceAuth, readFlags } from "@/lib/store";
+import { checkDeviceAuth, deviceFlagView, readFlags } from "@/lib/store";
 import {
   type DeviceMeta,
   type Metrics,
@@ -48,13 +48,7 @@ export async function POST(request: Request) {
   }
 
   const flags = await readFlags();
-  return Response.json({
-    ok: true,
-    arm: flags.arm,
-    live: flags.liveUntil > Date.now(),
-    testAt: flags.testAt,
-    orient: flags.orient,
-  });
+  return Response.json({ ok: true, ...deviceFlagView(flags) });
 }
 
 function sanitizeMetrics(raw: unknown): Metrics | null {

@@ -136,4 +136,24 @@ inline bool telemetry(const char *id, const Metrics &m, const char *name,
   return post("/api/device/telemetry", body);
 }
 
+// Fire an ALARM EVENT: it lands in the dashboard event feed and pushes to
+// every subscribed phone with the camera's latest frame attached. This is the
+// one call a tripwire / door contact / panic button needs:
+//
+//   if (beamBroken)   lab::event("entrynode", "trip",  "entry beam");
+//   if (doorOpened)   lab::event("doornode",  "door",  "front door");
+//   if (buttonHeld)   lab::event("panic1",    "panic", "her button");
+//
+// Known kinds get their own push voice: trip · door · panic · sound ·
+// presence. Anything else shows as a generic ping. Set notify=false to log
+// the event silently (no phone push).
+inline bool event(const char *id, const char *kind, const char *label = nullptr,
+                  bool notify = true) {
+  String body = String("{\"device\":\"") + id + "\",\"kind\":\"" + kind + "\"";
+  if (label) body += String(",\"label\":\"") + label + "\"";
+  if (!notify) body += ",\"notify\":false";
+  body += "}";
+  return post("/api/device/event", body);
+}
+
 }  // namespace lab

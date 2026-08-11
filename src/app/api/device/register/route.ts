@@ -1,4 +1,4 @@
-import { checkDeviceAuth, readFlags } from "@/lib/store";
+import { checkDeviceAuth, deviceFlagView, readFlags } from "@/lib/store";
 import { type DeviceMeta, registerDevice, validDeviceId } from "@/lib/lab";
 
 // A node announces itself once on boot. Cameras, RF tools, sensors — anything
@@ -43,11 +43,5 @@ export async function POST(request: Request) {
   await registerDevice(device, meta);
 
   const flags = await readFlags();
-  return Response.json({
-    ok: true,
-    arm: flags.arm,
-    live: flags.liveUntil > Date.now(),
-    testAt: flags.testAt,
-    orient: flags.orient,
-  });
+  return Response.json({ ok: true, ...deviceFlagView(flags) });
 }

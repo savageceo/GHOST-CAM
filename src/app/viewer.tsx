@@ -9,8 +9,28 @@ type Newest = {
   rssi: number;
   kind: string;
 } | null;
-type Status = { arm: boolean; liveUntil: number; now: number; newest: Newest };
-type MotionEvent = { id: string; at: number; frames: string[] };
+type Status = {
+  arm: boolean;
+  liveUntil: number;
+  tlSec?: number;
+  bts?: boolean;
+  now: number;
+  newest: Newest;
+};
+type Light = {
+  device: string;
+  sku: string;
+  name: string;
+  controllable: boolean;
+};
+type MotionEvent = {
+  id: string;
+  at: number;
+  kind?: string;
+  label?: string | null;
+  device?: string;
+  frames: string[];
+};
 type TimelinePoint = { path: string; at: number };
 type Metrics = Record<string, number | string | boolean>;
 type TelemetryPoint = { at: number; metrics: Metrics };
@@ -66,7 +86,34 @@ const METRIC_INFO: Record<
   humidity: { label: "Humidity", unit: "%", color: "#22d3ee" },
   lux: { label: "Light", unit: "lx", color: "#facc15" },
   motion: { label: "Motion", unit: "", color: "#f472b6" },
+  soundDb: { label: "Sound level", unit: "dB", color: "#fb923c" },
+  soundPk: { label: "Sound peak", unit: "dB", color: "#f97316" },
 };
+
+// Event-kind chrome: icon + accent for each event source. Unknown kinds get
+// the generic ping look.
+const EVENT_KIND_INFO: Record<string, { icon: string; label: string }> = {
+  motion: { icon: "🚨", label: "motion" },
+  sound: { icon: "🔊", label: "loud noise" },
+  clip: { icon: "💾", label: "saved clip" },
+  bts: { icon: "🎬", label: "BTS capture" },
+  trip: { icon: "⚡", label: "tripwire" },
+  door: { icon: "🚪", label: "door" },
+  panic: { icon: "🆘", label: "panic" },
+  presence: { icon: "👤", label: "presence" },
+};
+const TL_WINDOWS = [1, 3, 6, 24] as const; // scrubber window (hours)
+const TL_CADENCES = [0, 1, 2, 5, 10] as const; // 0 = firmware default
+
+// Studio light presets — SAVAGE palette for shoots + a plain white.
+const LIGHT_PRESETS: { name: string; hex: string; r: number; g: number; b: number }[] = [
+  { name: "Savage red", hex: "#ff0033", r: 255, g: 0, b: 51 },
+  { name: "Purple", hex: "#7c3aed", r: 124, g: 58, b: 237 },
+  { name: "Cyan", hex: "#22d3ee", r: 34, g: 211, b: 238 },
+  { name: "Orange", hex: "#f97316", r: 249, g: 115, b: 22 },
+  { name: "Pink", hex: "#f472b6", r: 244, g: 114, b: 182 },
+  { name: "White", hex: "#ffffff", r: 255, g: 255, b: 255 },
+];
 
 function frameUrl(path: string, v: number | string): string {
   return `/api/view/frame?path=${encodeURIComponent(path)}&v=${v}`;
@@ -103,10 +150,12 @@ function clockLabel(ms: number): string {
     second: "2-digit",
   });
 }
-function eventLabel(id: string): string {
+function eventLabel(id: string, atMs?: number): string {
   const m = id.match(/^e(\d{4})-(\d{2})-(\d{2})T(\d{2})-(\d{2})-(\d{2})Z$/);
-  if (!m) return "before clock sync";
-  const at = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+  const at = m
+    ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6])
+    : atMs; // server-stamped events (clips, sensor pings) carry their own time
+  if (!at) return "before clock sync";
   return new Date(at).toLocaleString([], {
     weekday: "short",
     month: "short",
@@ -333,6 +382,14 @@ export default function Viewer() {
   const [reviewIndex, setReviewIndex] = useState<number | null>(null);
   const [reviewSrc, setReviewSrc] = useState<string | null>(null);
   const [playing, setPlaying] = useState(false);
+  const [tlWin, setTlWin] = useState<number>(1); // scrubber window (hours)
+  const [tlSec, setTlSec] = useState<number>(0); // cadence knob (0 = firmware)
+  const [clipIn, setClipIn] = useState<number | null>(null); // save-range in (ms)
+  const [clipOut, setClipOut] = useState<number | null>(null); // save-range out (ms)
+  const [bts, setBts] = useState(false); // 🎬 shoot mode
+  const [captureSent, setCaptureSent] = useState(false);
+  const [lights, setLights] = useState<Light[] | null>(null); // null = not loaded
+  const [lightsOn, setLightsOn] = useState(true); // govee configured?
   const [showAdd, setShowAdd] = useState(false);
   const [err, setErr] = useState("");
   const [flash, setFlash] = useState("");
@@ -369,6 +426,8 @@ export default function Viewer() {
   const applyStatus = useCallback((s: Status) => {
     skewRef.current = s.now - Date.now();
     setStatus(s);
+    if (typeof s.tlSec === "number") setTlSec(s.tlSec);
+    if (typeof s.bts === "boolean") setBts(s.bts);
     const newest = s.newest;
     // While the live WebSocket is delivering frames, don't let the status poll
     // overwrite them with the older newest-frame snapshot.
@@ -381,7 +440,7 @@ export default function Viewer() {
     }
   }, []);
 
-  const postFlags = useCallback(async (body: Record<string, boolean>) => {
+  const postFlags = useCallback(async (body: Record<string, boolean | number>) => {
     const res = await fetch("/api/view/flags", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -391,6 +450,7 @@ export default function Viewer() {
     const flags = (await res.json()) as {
       arm: boolean;
       liveUntil: number;
+      tlSec?: number;
       now: number;
     };
     setStatus((prev) =>
@@ -398,6 +458,7 @@ export default function Viewer() {
         ? { ...prev, arm: flags.arm, liveUntil: flags.liveUntil, now: flags.now }
         : prev,
     );
+    if (typeof flags.tlSec === "number") setTlSec(flags.tlSec);
     skewRef.current = flags.now - Date.now();
   }, []);
 
@@ -456,14 +517,15 @@ export default function Viewer() {
 
   const loadTimeline = useCallback(async () => {
     try {
-      const res = await fetch(`/api/view/timeline?device=${CAMERA_ID}&hours=1`, {
-        cache: "no-store",
-      });
+      const res = await fetch(
+        `/api/view/timeline?device=${CAMERA_ID}&hours=${tlWin}`,
+        { cache: "no-store" },
+      );
       if (!res.ok) return;
       const data = (await res.json()) as { points: TimelinePoint[] };
       setTimeline(data.points);
     } catch {}
-  }, []);
+  }, [tlWin]);
 
   const loadPins = useCallback(async () => {
     try {
@@ -472,6 +534,26 @@ export default function Viewer() {
       const data = (await res.json()) as { pins: Pin[] };
       setPins(data.pins);
     } catch {}
+  }, []);
+
+  const loadLights = useCallback(async (refresh = false) => {
+    try {
+      const res = await fetch(`/api/view/lights${refresh ? "?refresh=1" : ""}`, {
+        cache: "no-store",
+      });
+      if (!res.ok) {
+        setLights([]);
+        return;
+      }
+      const data = (await res.json()) as {
+        configured: boolean;
+        lights: Light[];
+      };
+      setLightsOn(data.configured);
+      setLights(data.lights);
+    } catch {
+      setLights([]);
+    }
   }, []);
 
   const loadTelemetry = useCallback(async (device: string) => {
@@ -491,6 +573,7 @@ export default function Viewer() {
     loadDevices();
     loadTimeline();
     loadPins();
+    loadLights();
     const onVisible = () => {
       if (document.visibilityState === "visible") tickRef.current();
     };
@@ -503,7 +586,7 @@ export default function Viewer() {
       clearInterval(tTimer);
       if (timerRef.current) clearTimeout(timerRef.current);
     };
-  }, [loadEvents, loadDevices, loadTimeline, loadPins]);
+  }, [loadEvents, loadDevices, loadTimeline, loadPins, loadLights]);
 
   useEffect(() => {
     loadTelemetry(selDevice);
@@ -755,6 +838,60 @@ export default function Viewer() {
     }
   }
 
+  // ── 🎬 BTS: shoot mode + on-demand capture burst ───────────────────────────
+  async function toggleBts() {
+    setBusy("bts");
+    try {
+      const next = !bts;
+      await postFlags({ bts: next });
+      setBts(next);
+      flashMsg(
+        next
+          ? "🎬 BTS mode — alerts off, timeline rolling as content"
+          : "Security mode — alerts back on",
+      );
+    } catch {
+      setErr("couldn't reach the server.");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function fireCapture() {
+    setBusy("capture");
+    try {
+      await postFlags({ capture: true });
+      setCaptureSent(true);
+      setTimeout(() => setCaptureSent(false), 12000);
+      flashMsg("🎬 Capturing — a full-res burst lands in Events in ~20s");
+    } catch {
+      setErr("couldn't reach the server.");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  // ── studio lights (Govee) ──────────────────────────────────────────────────
+  async function controlLight(
+    light: Light,
+    action: "power" | "brightness" | "color" | "ct",
+    value: boolean | number | { r: number; g: number; b: number },
+  ) {
+    setBusy(`light-${light.device}`);
+    try {
+      const res = await fetch("/api/view/lights", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device: light.device, sku: light.sku, action, value }),
+      });
+      if (!res.ok) throw new Error("light control failed");
+    } catch {
+      setErr(`couldn't reach ${light.name}.`);
+    } finally {
+      setBusy("");
+    }
+  }
+
   async function pinPath(path: string, label: string, kind: string) {
     setBusy("pin");
     try {
@@ -799,6 +936,76 @@ export default function Viewer() {
       });
     } catch {}
   }
+
+  // ── save-from-timeline: mark in/out while scrubbing, export as a clip ──────
+  const reviewAt = reviewIndex !== null ? timeline[reviewIndex]?.at ?? null : null;
+
+  function markIn() {
+    if (reviewAt === null) return;
+    setClipIn(reviewAt);
+    if (clipOut !== null && clipOut <= reviewAt) setClipOut(null);
+  }
+  function markOut() {
+    if (reviewAt === null) return;
+    setClipOut(reviewAt);
+    if (clipIn !== null && clipIn >= reviewAt) setClipIn(null);
+  }
+  function clearMarks() {
+    setClipIn(null);
+    setClipOut(null);
+  }
+
+  async function saveClip() {
+    if (clipIn === null || clipOut === null || clipOut <= clipIn) return;
+    setBusy("clip");
+    try {
+      const res = await fetch("/api/view/clip", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device: CAMERA_ID, fromMs: clipIn, toMs: clipOut }),
+      });
+      const j = (await res.json()) as { ok?: boolean; frames?: number; error?: string };
+      if (!res.ok || !j.ok) throw new Error(j.error ?? "save failed");
+      flashMsg(`Clip saved — ${j.frames} frames now permanent ✓`);
+      clearMarks();
+      loadEvents();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "couldn't save that range.");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function setCadence(sec: number) {
+    try {
+      await postFlags({ tlSec: sec });
+      flashMsg(
+        sec === 0
+          ? "Cadence back to the firmware default"
+          : `Timeline cadence → every ${sec}s (camera adopts it within seconds)`,
+      );
+    } catch {
+      setErr("couldn't reach the server.");
+    }
+  }
+
+  // ms → 0..1 position on the current track (nearest timeline point).
+  const fracForMs = useCallback(
+    (ms: number): number | null => {
+      if (timeline.length < 2) return null;
+      let best = 0;
+      let bestD = Number.POSITIVE_INFINITY;
+      for (let i = 0; i < timeline.length; i++) {
+        const d = Math.abs(timeline[i].at - ms);
+        if (d < bestD) {
+          bestD = d;
+          best = i;
+        }
+      }
+      return best / (timeline.length - 1);
+    },
+    [timeline],
+  );
 
   async function logout() {
     await fetch("/api/auth", { method: "DELETE" });
@@ -945,6 +1152,7 @@ export default function Viewer() {
           <span className={`dot ${dotClass}`} />
           {statusText}
         </span>
+        {bts && <span className="pill btspill">🎬 BTS</span>}
       </header>
 
       {flash && <div className="flash">{flash}</div>}
@@ -1023,10 +1231,22 @@ export default function Viewer() {
             <span className="scrub-time">
               {reviewing && reviewPoint ? clockLabel(reviewPoint.at) : "LIVE NOW"}
             </span>
-            <span className="scrub-meta">
-              {timeline.length
-                ? `${timeline.length} frames · last 1h · 1s`
-                : "building timeline…"}
+            <span className="winsel">
+              {TL_WINDOWS.map((h) => (
+                <button
+                  type="button"
+                  key={h}
+                  className={`winbtn ${tlWin === h ? "on" : ""}`}
+                  onClick={() => {
+                    setPlaying(false);
+                    setReviewIndex(null);
+                    clearMarks();
+                    setTlWin(h);
+                  }}
+                >
+                  {h}h
+                </button>
+              ))}
             </span>
           </div>
           <div
@@ -1045,12 +1265,27 @@ export default function Viewer() {
               scrubbingRef.current = false;
             }}
           >
+            {clipIn !== null &&
+              (() => {
+                const a = fracForMs(clipIn);
+                const b = clipOut !== null ? fracForMs(clipOut) : a;
+                if (a === null || b === null) return null;
+                return (
+                  <div
+                    className="track-range"
+                    style={{
+                      left: `${a * 100}%`,
+                      width: `${Math.max(0.5, (b - a) * 100)}%`,
+                    }}
+                  />
+                );
+              })()}
             <div className="track-fill" style={{ width: `${fillPct}%` }} />
             <div className="track-head" style={{ left: `${fillPct}%` }} />
           </div>
           <div className="track-labels">
-            <span>−60m</span>
-            <span>−30m</span>
+            <span>−{tlWin}h</span>
+            <span>−{tlWin / 2}h</span>
             <span>now</span>
           </div>
           <div className="scrub-controls">
@@ -1098,6 +1333,45 @@ export default function Viewer() {
               Live
             </button>
           </div>
+          <div className="scrub-controls saveclip">
+            <button
+              type="button"
+              className={`sbtn ${clipIn !== null ? "on" : ""}`}
+              onClick={markIn}
+              disabled={reviewAt === null}
+              title="Mark clip start at the scrubbed moment"
+            >
+              ⟦ In
+            </button>
+            <button
+              type="button"
+              className={`sbtn ${clipOut !== null ? "on" : ""}`}
+              onClick={markOut}
+              disabled={reviewAt === null}
+              title="Mark clip end at the scrubbed moment"
+            >
+              Out ⟧
+            </button>
+            <button
+              type="button"
+              className="sbtn save"
+              onClick={saveClip}
+              disabled={
+                busy === "clip" ||
+                clipIn === null ||
+                clipOut === null ||
+                clipOut <= clipIn
+              }
+              title="Copy the marked range out of the rolling window — kept forever"
+            >
+              {busy === "clip" ? "Saving…" : "💾 Save clip"}
+            </button>
+            {(clipIn !== null || clipOut !== null) && (
+              <button type="button" className="sbtn" onClick={clearMarks}>
+                ✕
+              </button>
+            )}
+          </div>
         </div>
       </section>
 
@@ -1127,6 +1401,32 @@ export default function Viewer() {
           {testSent ? "Sent ✓" : "Test alert"}
         </button>
       </div>
+      <div className="row">
+        <button
+          type="button"
+          className={`btn ${bts ? "bts" : ""}`}
+          onClick={toggleBts}
+          disabled={busy === "bts" || !status}
+          title="BTS shoot mode: motion + sound alerts off, timeline keeps rolling as content"
+        >
+          {bts ? "🎬 BTS ON" : "🎬 BTS mode"}
+        </button>
+        <button
+          type="button"
+          className="btn"
+          onClick={fireCapture}
+          disabled={busy === "capture" || !status}
+          title="Record a full-res burst right now — lands in Events, no alert"
+        >
+          {captureSent ? "Rolling… ✓" : "⏺ Capture"}
+        </button>
+      </div>
+      {bts && (
+        <p className="btsnote">
+          🎬 BTS mode is on — no alerts will fire. The timeline is your
+          b-roll: shoot, then scrub → ⟦ In / Out ⟧ → 💾 Save clip.
+        </p>
+      )}
       {err && <p className="err">{err}</p>}
 
       {(notif === "idle" || notif === "need-install") && (
@@ -1232,8 +1532,76 @@ export default function Viewer() {
         </div>
       )}
 
+      {lightsOn && (
+        <>
+          <div className="section">
+            <h2>Studio lights</h2>
+            <button type="button" className="linky" onClick={() => loadLights(true)}>
+              refresh
+            </button>
+          </div>
+          {lights === null && <p className="note">loading lights…</p>}
+          {lights !== null && lights.length === 0 && (
+            <p className="note">
+              no Govee lights found — check the strips are online in the Govee
+              Home app.
+            </p>
+          )}
+          {lights?.map((l) => (
+            <div className="light" key={l.device}>
+              <div className="light-head">
+                <span className="light-name">💡 {l.name}</span>
+                <span className="light-sku">{l.sku}</span>
+              </div>
+              <div className="light-controls">
+                <button
+                  type="button"
+                  className="lbtn"
+                  onClick={() => controlLight(l, "power", true)}
+                  disabled={busy === `light-${l.device}`}
+                >
+                  On
+                </button>
+                <button
+                  type="button"
+                  className="lbtn"
+                  onClick={() => controlLight(l, "power", false)}
+                  disabled={busy === `light-${l.device}`}
+                >
+                  Off
+                </button>
+                {LIGHT_PRESETS.map((p) => (
+                  <button
+                    type="button"
+                    key={p.name}
+                    className="swatch"
+                    style={{ background: p.hex }}
+                    title={p.name}
+                    onClick={() =>
+                      controlLight(l, "color", { r: p.r, g: p.g, b: p.b })
+                    }
+                    disabled={busy === `light-${l.device}`}
+                  />
+                ))}
+                <input
+                  type="range"
+                  className="light-dim"
+                  min={1}
+                  max={100}
+                  defaultValue={100}
+                  title="Brightness"
+                  onPointerUp={(e) =>
+                    controlLight(l, "brightness", Number(e.currentTarget.value))
+                  }
+                />
+              </div>
+            </div>
+          ))}
+        </>
+      )}
+
       <div className="section">
-        <h2>Motion events</h2>
+        <h2>Events</h2>
         <button type="button" className="linky" onClick={loadEvents}>
           refresh
         </button>
@@ -1241,41 +1609,68 @@ export default function Viewer() {
       {events === null && <p className="note">loading events…</p>}
       {events !== null && events.length === 0 && (
         <p className="note">
-          nothing yet — when the camera is armed and sees motion, photo bursts
+          nothing yet — motion clips, loud-noise clips, saved timeline ranges,
+          and sensor-node alerts (tripwires, door contacts, panic button) all
           land here (and ping your phone).
         </p>
       )}
-      {events?.map((event) => (
-        <div className="event" key={event.id}>
-          <div className="head">
-            <span className="when">
-              {eventLabel(event.id)}
-              <em className="evlen"> · {event.frames.length}f clip</em>
-            </span>
-            <div className="evactions">
-              <button
-                type="button"
-                className="evpin"
-                onClick={() =>
-                  event.frames[0] &&
-                  pinPath(event.frames[0], eventLabel(event.id), "motion")
-                }
-              >
-                📌
-              </button>
-              <button
-                type="button"
-                className="kill"
-                onClick={() => removeEvent(event.id)}
-                aria-label="delete event"
-              >
-                ✕
-              </button>
+      {events?.map((event) => {
+        const kindInfo = EVENT_KIND_INFO[event.kind ?? "motion"] ?? {
+          icon: "📟",
+          label: event.kind ?? "event",
+        };
+        return (
+          <div className="event" key={event.id}>
+            <div className="head">
+              <span className="when">
+                <em className="evkind" title={kindInfo.label}>
+                  {kindInfo.icon}
+                </em>{" "}
+                {eventLabel(event.id, event.at)}
+                {event.frames.length > 0 && (
+                  <em className="evlen"> · {event.frames.length}f clip</em>
+                )}
+                {event.label && <em className="evlen"> · {event.label}</em>}
+              </span>
+              <div className="evactions">
+                {event.frames.length > 0 && (
+                  <button
+                    type="button"
+                    className="evpin"
+                    onClick={() =>
+                      event.frames[0] &&
+                      pinPath(
+                        event.frames[0],
+                        eventLabel(event.id, event.at),
+                        event.kind ?? "motion",
+                      )
+                    }
+                  >
+                    📌
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="kill"
+                  onClick={() => removeEvent(event.id)}
+                  aria-label="delete event"
+                >
+                  ✕
+                </button>
+              </div>
             </div>
+            {event.frames.length > 0 ? (
+              <ClipPlayer frames={event.frames} transform={thumbTransform} />
+            ) : (
+              <div className="evping">
+                {kindInfo.icon} {kindInfo.label}
+                {event.device ? ` — ${event.device}` : ""}
+                {event.label ? ` · ${event.label}` : ""}
+              </div>
+            )}
           </div>
-          <ClipPlayer frames={event.frames} transform={thumbTransform} />
-        </div>
-      ))}
+        );
+      })}
 
       <div className="section">
         <h2>Pinned archive</h2>
@@ -1316,8 +1711,27 @@ export default function Viewer() {
         </div>
       )}
 
+      <p className="note cadence">
+        snapshot cadence:{" "}
+        {TL_CADENCES.map((s) => (
+          <button
+            type="button"
+            key={s}
+            className={`winbtn ${tlSec === s ? "on" : ""}`}
+            onClick={() => setCadence(s)}
+            title={
+              s === 0
+                ? "firmware default (config.h TIMELINE_SECONDS)"
+                : `one snapshot every ${s}s`
+            }
+          >
+            {s === 0 ? "auto" : `${s}s`}
+          </button>
+        ))}
+      </p>
+
       <p className="note">
-        1s timeline · last hour · pins kept forever ·{" "}
+        24h timeline · clips &amp; pins kept forever ·{" "}
         {notif !== "unsupported" && (
           <>
             <button type="button" className="linky" onClick={alertsClick}>

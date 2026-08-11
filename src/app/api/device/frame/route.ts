@@ -3,6 +3,7 @@ import { waitUntil } from "@vercel/functions";
 import {
   BLOB_ACCESS,
   checkDeviceAuth,
+  deviceFlagView,
   liveFramePath,
   MOTION_PREFIX,
   pruneLiveFrames,
@@ -86,12 +87,18 @@ export async function POST(request: Request) {
   // Index the frame. Motion bursts group under their event id; the first burst
   // frame also lands in `frames` so it becomes the newest hero shot.
   if (kind === "motion") {
+    // &type=sound marks a mic-triggered burst (loud noise → the camera records
+    // the same clip shape as motion); &type=bts marks an on-demand 🎬 capture
+    // burst (shoot content, never pushes). Anything else stays kind "motion".
+    const typeParam = searchParams.get("type");
+    const evKind =
+      typeParam === "sound" ? "sound" : typeParam === "bts" ? "bts" : "motion";
     try {
-      await recordMotionFrame(motionEvent, device, now, path, motionSeq);
+      await recordMotionFrame(motionEvent, device, now, path, motionSeq, evKind);
     } catch {}
     if (motionSeq === 0) {
       try {
-        await recordFrame(device, "motion", now, path, { sd, rssi: cleanRssi });
+        await recordFrame(device, evKind, now, path, { sd, rssi: cleanRssi });
       } catch {}
     }
     // One Web Push per motion session. New firmware sets notify=1 on the very
@@ -99,18 +106,29 @@ export async function POST(request: Request) {
     // notify param, so fall back to seq 0 to stay compatible.
     const notifyParam = searchParams.get("notify");
     const shouldNotify =
-      notifyParam === "1" || (notifyParam === null && motionSeq === 0);
+      evKind !== "bts" &&
+      (notifyParam === "1" || (notifyParam === null && motionSeq === 0));
     if (shouldNotify) {
       try {
         const image = await signedUrlFor(path);
         waitUntil(
-          sendPushToAll({
-            title: "🚨 Motion in your lab",
-            body: "Tap to watch the live camera.",
-            url: "/",
-            image,
-            tag: "motion",
-          }),
+          sendPushToAll(
+            evKind === "sound"
+              ? {
+                  title: "🔊 Loud noise in your lab",
+                  body: "The mic tripped — tap to watch the live camera.",
+                  url: "/",
+                  image,
+                  tag: "sound",
+                }
+              : {
+                  title: "🚨 Motion in your lab",
+                  body: "Tap to watch the live camera.",
+                  url: "/",
+                  image,
+                  tag: "motion",
+                },
+          ),
         );
       } catch {}
     }
@@ -135,11 +153,5 @@ export async function POST(request: Request) {
   }
 
   const flags = await readFlags();
-  return Response.json({
-    ok: true,
-    arm: flags.arm,
-    live: flags.liveUntil > Date.now(),
-    testAt: flags.testAt,
-    orient: flags.orient,
-  });
+  return Response.json({ ok: true, ...deviceFlagView(flags) });
 }

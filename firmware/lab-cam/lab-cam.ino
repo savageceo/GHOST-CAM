@@ -7,21 +7,55 @@
 //       - streamed to the SAVAGE LAB cloud (each clip a playable event)
 //       - one ntfy + one web push per session, first frame attached
 //       - archived to microSD when a card is present (ring buffer)
+//   · MIC (Sense onboard PDM): continuous sound-level metering → dashboard
+//     chart, and a loud-noise trigger (bang / glass / door slam) that records
+//     the same clip shape as motion — the sound event ALWAYS records; the
+//     phone push is armed-gated unless SOUND_PUSH_WHEN_DISARMED=1
 //   · TIMELINE: one snapshot every TIMELINE_SECONDS builds the scrubbable 24h
-//     history on the dashboard and doubles as the heartbeat
-//   · TELEMETRY: chip temp / wifi / free memory / uptime every TELEMETRY_SECONDS
-//     → live sensor charts on the dashboard
+//     history on the dashboard and doubles as the heartbeat. The dashboard's
+//     cadence knob overrides the interval live (flag "tl", no reflash).
+//   · TELEMETRY: chip temp / wifi / free memory / uptime / sound level every
+//     TELEMETRY_SECONDS → live sensor charts on the dashboard
 //   · self-registers in the device grid on boot (name/type/caps/firmware)
 //   · "go live" from the cloud: while you watch, the sensor drops to a fast
 //     live size (HD, ~10-14 fps over the WebSocket relay) and pushes frames in
 //     near-real-time, then returns to UXGA for crisp stills when you stop
 //
-// Split across cores like bunny-hop: capture/motion on core 1, WiFi + uploads
-// on core 0, camera behind one mutex, SD behind another.
+// Split across cores like bunny-hop: capture/motion/mic on core 1, WiFi +
+// uploads on core 0, camera behind one mutex, SD behind another.
 //
 // Build: board "XIAO_ESP32S3", Tools → PSRAM: "OPI PSRAM" (required).
 
 #include "config.h"
+
+// ── new-knob fallbacks ────────────────────────────────────────────────────
+// Every knob added after the first flash defaults here, so an existing
+// config.h keeps compiling untouched. Copy the matching block from
+// config.h.example into your config.h to tune them.
+#ifndef MIC_ENABLED
+#define MIC_ENABLED 1  // Sense onboard PDM mic: sound chart + loud-noise clips
+#endif
+#ifndef MIC_CLK_PIN
+#define MIC_CLK_PIN 42  // XIAO ESP32S3 Sense PDM clock
+#endif
+#ifndef MIC_DATA_PIN
+#define MIC_DATA_PIN 41  // XIAO ESP32S3 Sense PDM data
+#endif
+#ifndef SOUND_TRIGGER_DB
+#define SOUND_TRIGGER_DB 18.0f  // dB above the ambient floor that counts as "loud"
+#endif
+#ifndef SOUND_MIN_DBFS
+#define SOUND_MIN_DBFS -34.0f  // absolute loudness gate (dBFS, 0 = clipping)
+#endif
+#ifndef SOUND_MIN_MS
+#define SOUND_MIN_MS 120  // must stay loud this long (kills clicks/pops)
+#endif
+#ifndef SOUND_COOLDOWN_S
+#define SOUND_COOLDOWN_S 45  // min gap between sound-triggered sessions
+#endif
+#ifndef SOUND_PUSH_WHEN_DISARMED
+#define SOUND_PUSH_WHEN_DISARMED 0  // 1 = loud-noise pushes even when disarmed
+#endif
 
 #include <Arduino.h>
 #include <ESPmDNS.h>
@@ -39,6 +73,9 @@
 #include <JPEGDEC.h>  // motion decoder (bitbank2). The core-3.x esp_jpeg/tjpgd
                       // decoder rejects the OV2640's JPEGs (JDR_FMT1); JPEGDEC
                       // decodes them fine. Install: arduino-cli lib install JPEGDEC
+#if MIC_ENABLED
+#include <ESP_I2S.h>  // core 3.x I2S driver — PDM RX for the Sense's mic
+#endif
 
 // ── XIAO ESP32S3 Sense pin map ──────────────────────────────────────────
 #define PWDN_GPIO_NUM -1
@@ -70,12 +107,23 @@ static volatile bool cloudLive = false;  // cloud says someone is watching
 static volatile bool liveCaptureActive = false;  // sensor is in fast live-view mode
 static volatile bool eventRequested = false;  // a clip session is requested
 static volatile bool eventIsTest = false;
+static volatile bool eventIsSound = false;    // session came from the mic
+static volatile bool eventIsBts = false;      // session is a 🎬 capture burst
+static volatile bool eventNotify = true;      // session may ping the phone
+static volatile bool btsMode = false;         // 🎬 shoot mode: alerts suppressed,
+                                              // timeline keeps rolling as content
+static int64_t lastCaptureAt = -1;  // -1 until primed by first cloud contact
 static volatile bool sessionActive = false;   // a clip session is currently recording
 static volatile int64_t lastMotionMs = 0;     // last sample that saw motion (recheck signal)
 static volatile int64_t lastSessionEndMs = -100000;  // between-session cooldown anchor
 static int64_t lastTestAt = -1;  // -1 until primed by first cloud contact
 static volatile int64_t lastCloudOkMs = -1;
 static volatile int64_t epochMsOffset = 0;  // epoch_ms - boot_ms after NTP
+static volatile int tlSeconds = TIMELINE_SECONDS;  // timeline cadence — the
+                                                   // dashboard knob ("tl" flag)
+                                                   // overrides it live
+static volatile float soundDbNow = -100.0f;   // latest mic RMS level (dBFS)
+static volatile float soundDbPeak = -100.0f;  // peak since last telemetry post
 
 static int64_t bootMs() { return esp_timer_get_time() / 1000; }
 
@@ -385,18 +433,54 @@ static void applyFlags(const String &resp) {
     bool want180 = (orient == 180);
     if (want180 != prefs.getBool("vflip", CAM_VFLIP)) applyOrientation(want180);
   }
+  // Timeline cadence knob: "tl" seconds from the dashboard. 0 = use the
+  // compiled TIMELINE_SECONDS; 1-10 = live override, no reflash.
+  int64_t tl = jsonInt(resp, "tl", -1);
+  if (tl >= 0 && tl <= 10) {
+    int want = (tl == 0) ? TIMELINE_SECONDS : (int)tl;
+    if (want != tlSeconds) {
+      tlSeconds = want;
+      Serial.printf("[tl] cadence → every %ds (cloud knob)\n", want);
+    }
+  }
+  // 🎬 BTS shoot mode: suppresses motion/sound triggers (models moving and
+  // music playing are the point, not an intrusion); timeline + live continue.
+  bool bts = jsonBool(resp, "bts", btsMode);
+  if (bts != (bool)btsMode) {
+    btsMode = bts;
+    Serial.printf("[bts] shoot mode %s\n", bts ? "ON — alerts muted" : "off");
+  }
+  // 🎬 On-demand capture burst (dashboard ⏺ Capture): edge-triggered like
+  // testAt, but silent — filed as a "bts" event, no push, no ntfy.
+  int64_t cap = jsonInt(resp, "captureAt", 0);
+  if (lastCaptureAt < 0) {
+    lastCaptureAt = cap;  // prime — an old press never refires after reboot
+  } else if (cap > lastCaptureAt) {
+    lastCaptureAt = cap;
+    if (!eventRequested && !sessionActive) {
+      eventIsTest = false;
+      eventIsSound = false;
+      eventIsBts = true;
+      eventNotify = false;
+      eventRequested = true;
+    }
+  }
 }
 
 // POST one JPEG. The response carries the flags, so a streaming camera hears
 // "stop"/"disarm"/"test" without separate polls. Every frame is tagged with
 // this node's DEVICE_ID so the cloud files it under the right device.
+// evType marks non-motion burst sources ("sound") so the cloud files the event
+// under the right kind and uses the right push voice.
 static bool pushFrame(const char *kind, const char *eventId, int seq,
-                      const uint8_t *jpg, size_t len, bool notify = false) {
+                      const uint8_t *jpg, size_t len, bool notify = false,
+                      const char *evType = nullptr) {
   String q = String("/api/device/frame?kind=") + kind + "&seq=" + seq +
              "&device=" + DEVICE_ID;
   if (eventId) {
     // notify=1 tells the cloud to fire ONE web push (the session's first frame).
     q += String("&event=") + eventId + "&notify=" + (notify ? "1" : "0");
+    if (evType) q += String("&type=") + evType;
   } else {
     q += String("&sd=") + (sdOk ? 1 : 0) + "&rssi=" + (int)abs(WiFi.RSSI());
   }
@@ -420,9 +504,14 @@ static bool streamPush(const uint8_t *jpg, size_t len) {
 static bool registered = false;
 
 static void postRegister() {
+  String caps = "[\"camera\",\"motion\",\"stream\",\"microSD\"";
+#if MIC_ENABLED
+  caps += ",\"mic\"";
+#endif
+  caps += "]";
   String body = String("{\"device\":\"") + DEVICE_ID + "\",\"name\":\"" +
                 DEVICE_NAME + "\",\"type\":\"" + DEVICE_TYPE +
-                "\",\"caps\":[\"camera\",\"motion\",\"stream\",\"microSD\"]," +
+                "\",\"caps\":" + caps + "," +
                 "\"firmware\":\"" + FIRMWARE_TAG + "\"}";
   String resp;
   if (cloudCall(true, "/api/device/register", (const uint8_t *)body.c_str(),
@@ -433,17 +522,25 @@ static void postRegister() {
   }
 }
 
-// chip temp + wifi + memory + uptime → the dashboard's sensor charts.
+// chip temp + wifi + memory + uptime (+ sound level) → the dashboard charts.
 static void postTelemetry() {
   float tempC = temperatureRead();
   long uptimeMin = (long)(bootMs() / 60000);
   int heapKB = (int)(ESP.getFreeHeap() / 1024);
   int rssi = (int)WiFi.RSSI();
+  String metrics = String("\"rssi\":") + rssi + ",\"tempC\":" +
+                   String(tempC, 1) + ",\"heapKB\":" + heapKB +
+                   ",\"uptimeMin\":" + uptimeMin +
+                   ",\"sd\":" + (sdOk ? "true" : "false") +
+                   ",\"armed\":" + (armed ? "true" : "false") +
+                   ",\"bts\":" + (btsMode ? "true" : "false");
+#if MIC_ENABLED
+  metrics += String(",\"soundDb\":") + String((float)soundDbNow, 1) +
+             ",\"soundPk\":" + String((float)soundDbPeak, 1);
+  soundDbPeak = -100.0f;  // peak-hold window = one telemetry interval
+#endif
   String body = String("{\"device\":\"") + DEVICE_ID + "\",\"metrics\":{" +
-                "\"rssi\":" + rssi + ",\"tempC\":" + String(tempC, 1) +
-                ",\"heapKB\":" + heapKB + ",\"uptimeMin\":" + uptimeMin +
-                ",\"sd\":" + (sdOk ? "true" : "false") +
-                ",\"armed\":" + (armed ? "true" : "false") + "}}";
+                metrics + "}}";
   String resp;
   if (cloudCall(true, "/api/device/telemetry", (const uint8_t *)body.c_str(),
                 body.length(), "application/json", resp)) {
@@ -489,13 +586,19 @@ static void makeEventId(char *id, size_t n) {
 }
 
 // Record one CLIP_SECONDS clip at CLIP_FPS to SD + cloud. Alerts (ntfy + the
-// cloud web push) fire only on the very first frame of the session. After each
-// clip we watch RECHECK_SECONDS for continued movement (motionTask keeps
-// sampling and stamps lastMotionMs); if it's still moving we record another,
-// up to MAX_CLIPS. Each clip is its own dashboard event.
-static void runMotionSession(bool isTest) {
-  Serial.printf("[event] SESSION start (%s)\n", isTest ? "TEST" : "MOTION");
+// cloud web push) fire only on the very first frame of the session — and only
+// when allowNotify (sound events always record, but a disarmed camera pings
+// the phone only if SOUND_PUSH_WHEN_DISARMED=1). After each clip we watch
+// RECHECK_SECONDS for continued movement (motionTask keeps sampling and stamps
+// lastMotionMs); if it's still moving we record another, up to MAX_CLIPS.
+// Each clip is its own dashboard event; isSound files it under kind "sound".
+static void runEventSession(bool isTest, bool isSound, bool isBts,
+                            bool allowNotify) {
+  const char *why =
+      isTest ? "TEST" : isSound ? "SOUND" : isBts ? "BTS" : "MOTION";
+  Serial.printf("[event] SESSION start (%s)\n", why);
   const int64_t frameGap = 1000 / (CLIP_FPS < 1 ? 1 : CLIP_FPS);
+  const char *evType = isSound ? "sound" : isBts ? "bts" : nullptr;
   bool firstFrame = true;
   int clips = 0;
   for (;;) {
@@ -511,12 +614,14 @@ static void runMotionSession(bool isTest) {
       uint8_t *jpg = grabJpeg(&len);
       if (jpg) {
         sdSaveFrame(id, seq, jpg, len);
-        if (firstFrame) {
-          ntfyPush(isTest ? "Test alert — camera is watching"
-                          : "Motion in your lab",
+        if (firstFrame && allowNotify) {
+          ntfyPush(isTest    ? "Test alert — camera is watching"
+                   : isSound ? "Loud noise in your lab"
+                             : "Motion in your lab",
                    nullptr, isTest ? "default" : "high", jpg, len);
         }
-        pushFrame("motion", id, seq, jpg, len, firstFrame);  // notify once
+        pushFrame("motion", id, seq, jpg, len, firstFrame && allowNotify,
+                  evType);  // notify once
         firstFrame = false;
         seq++;
         free(jpg);
@@ -526,8 +631,10 @@ static void runMotionSession(bool isTest) {
     }
     clips++;
     Serial.printf("[event] clip %d done — %d frames\n", clips, seq);
-    if (isTest || clips >= MAX_CLIPS) break;
+    if (isTest || isBts || clips >= MAX_CLIPS) break;  // capture = one clip
     // Watch for continued movement; motionTask stamps lastMotionMs each hit.
+    // (A sound session extends on movement too — if the bang was someone
+    // getting in, the follow-up clips track them.)
     int64_t recheckStart = bootMs();
     bool cont = false;
     while (bootMs() - recheckStart < (int64_t)RECHECK_SECONDS * 1000) {
@@ -671,8 +778,8 @@ static void motionTask(void *) {
         peakPct = 0;
       }
       hits = moving ? hits + 1 : 0;
-      if (hits >= MOTION_CONSEC && armed && !eventRequested && !sessionActive &&
-          bootMs() > (int64_t)BOOT_GRACE_S * 1000 &&
+      if (hits >= MOTION_CONSEC && armed && !btsMode && !eventRequested &&
+          !sessionActive && bootMs() > (int64_t)BOOT_GRACE_S * 1000 &&
           bootMs() - lastSessionEndMs > (int64_t)MOTION_COOLDOWN_S * 1000) {
         hits = 0;
         eventIsTest = false;
@@ -686,6 +793,85 @@ static void motionTask(void *) {
     havePrev = true;
   }
 }
+
+// ── mic sampler (core 1) — the Sense's PDM mic, finally earning its keep ─
+// 16 kHz mono via I2S-PDM DMA. Every ~16 ms chunk becomes an RMS level in
+// dBFS (0 = clipping, quiet room ≈ −55…−70). A slow EMA tracks the ambient
+// floor; a chunk SOUND_TRIGGER_DB above the floor AND louder than
+// SOUND_MIN_DBFS, sustained SOUND_MIN_MS, fires a clip session — same shape
+// as motion, filed under kind "sound". Level + peak stream to the dashboard
+// charts via telemetry (soundDb / soundPk).
+//
+// Policy (Niko, 2026-08-11): the mic is ALWAYS on and sound events always
+// record, armed or not. Only the phone push is armed-gated (flip
+// SOUND_PUSH_WHEN_DISARMED to 1 to ping always).
+#if MIC_ENABLED
+static I2SClass micI2s;
+
+static void micTask(void *) {
+  micI2s.setPinsPdmRx(MIC_CLK_PIN, MIC_DATA_PIN);
+  if (!micI2s.begin(I2S_MODE_PDM_RX, 16000, I2S_DATA_BIT_WIDTH_16BIT,
+                    I2S_SLOT_MODE_MONO)) {
+    Serial.println("[mic] init failed — sound detection off");
+    vTaskDelete(nullptr);
+    return;
+  }
+  Serial.println("[mic] PDM mic on — level metering + loud-noise trigger");
+  static int16_t buf[256];  // 256 samples @16 kHz = 16 ms per chunk
+  float floorDb = -55.0f;   // adaptive ambient floor (starts at "quiet room")
+  int loudMs = 0;
+  int64_t lastSoundEvt = -1000000;
+  int64_t lastLevelLog = 0;
+
+  for (;;) {
+    size_t got = micI2s.readBytes((char *)buf, sizeof(buf));
+    if (got < sizeof(buf)) {
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+    const int n = (int)(got / 2);
+    double sum = 0;
+    for (int i = 0; i < n; i++) {
+      double s = (double)buf[i];
+      sum += s * s;
+    }
+    float rms = (float)sqrt(sum / n);
+    float db = rms < 1.0f ? -100.0f : 20.0f * log10f(rms / 32768.0f);
+    soundDbNow = db;
+    if (db > soundDbPeak) soundDbPeak = db;
+
+    // Ambient floor: adapts down quickly (quiet returns fast) and up very
+    // slowly — a party can't teach the trigger that loud is normal.
+    if (db < floorDb) floorDb = floorDb * 0.995f + db * 0.005f;
+    else floorDb = floorDb * 0.9995f + db * 0.0005f;
+
+    const int chunkMs = n * 1000 / 16000;
+    bool loud = (db > floorDb + SOUND_TRIGGER_DB) && (db > SOUND_MIN_DBFS);
+    loudMs = loud ? loudMs + chunkMs : 0;
+
+    // ~30s heartbeat on serial for tuning.
+    if (bootMs() - lastLevelLog > 30000) {
+      lastLevelLog = bootMs();
+      Serial.printf("[mic] level %.1f dBFS · floor %.1f · peak %.1f\n", db,
+                    floorDb, (float)soundDbPeak);
+    }
+
+    if (loudMs >= SOUND_MIN_MS && !btsMode && !eventRequested &&
+        !sessionActive && bootMs() > (int64_t)BOOT_GRACE_S * 1000 &&
+        bootMs() - lastSoundEvt > (int64_t)SOUND_COOLDOWN_S * 1000 &&
+        bootMs() - lastSessionEndMs > (int64_t)MOTION_COOLDOWN_S * 1000) {
+      loudMs = 0;
+      lastSoundEvt = bootMs();
+      eventIsTest = false;
+      eventIsSound = true;
+      eventNotify = armed || SOUND_PUSH_WHEN_DISARMED;
+      eventRequested = true;
+      Serial.printf("[mic] TRIGGER %.1f dBFS (floor %.1f) → clip session%s\n",
+                    db, floorDb, eventNotify ? "" : " (recorded, no push — disarmed)");
+    }
+  }
+}
+#endif  // MIC_ENABLED
 
 // ── local web: UI on :80, stream on :81 ─────────────────────────────────
 // Two servers because a running MJPEG stream occupies its server's task;
@@ -944,7 +1130,13 @@ static void netTask(void *) {
     if (eventRequested) {
       eventRequested = false;
       sessionActive = true;
-      runMotionSession(eventIsTest);
+      bool isSound = eventIsSound;
+      bool isBts = eventIsBts;
+      bool notifyOk = eventNotify;
+      eventIsSound = false;
+      eventIsBts = false;
+      eventNotify = true;
+      runEventSession(eventIsTest, isSound, isBts, notifyOk);
       sessionActive = false;
       lastSessionEndMs = bootMs();
       continue;
@@ -1006,7 +1198,7 @@ static void netTask(void *) {
       postTelemetry();
     }
 
-    if (bootMs() - lastTlFrame >= (int64_t)TIMELINE_SECONDS * 1000) {
+    if (bootMs() - lastTlFrame >= (int64_t)tlSeconds * 1000) {
       size_t len = 0;
       uint8_t *jpg = grabJpeg(&len);
       bool pushed = false;
@@ -1017,7 +1209,7 @@ static void netTask(void *) {
       // On failure retry in ~20s instead of hammering or going dark.
       lastTlFrame = pushed
                         ? bootMs()
-                        : bootMs() - (int64_t)TIMELINE_SECONDS * 1000 + 20000;
+                        : bootMs() - (int64_t)tlSeconds * 1000 + 20000;
     }
 
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -1055,8 +1247,11 @@ void setup() {
 
   xTaskCreatePinnedToCore(motionTask, "motion", 12288, nullptr, 1, nullptr, 1);
   xTaskCreatePinnedToCore(netTask, "net", 16384, nullptr, 1, nullptr, 0);
-  Serial.printf("[lab-cam] device=%s armed=%s\n", DEVICE_ID,
-                armed ? "yes" : "no");
+#if MIC_ENABLED
+  xTaskCreatePinnedToCore(micTask, "mic", 6144, nullptr, 1, nullptr, 1);
+#endif
+  Serial.printf("[lab-cam] device=%s armed=%s mic=%s\n", DEVICE_ID,
+                armed ? "yes" : "no", MIC_ENABLED ? "on" : "off");
 }
 
 void loop() {

@@ -39,10 +39,32 @@ Three stores, split by job:
   then snaps back to full **UXGA** for stills. Falls back automatically to HTTP
   frame POSTs (~1.4 fps) if the socket can't connect (`USE_WS_STREAM 0`). Frames
   paint straight to the page (no per-frame re-render), so it stays smooth.
-- **Timeline scrubber + timelapse.** The camera saves one snapshot per second.
-  Drag the scrubber to any moment in the retained window, or hit **▶ Timelapse**
-  to play it back. Images are kept ~3h (`TIMELINE_HOURS`); telemetry ~24h
+- **24h timeline scrubber + timelapse.** The camera saves one snapshot per
+  second (cadence adjustable from the dashboard — no reflash). Pick a window
+  (1h/3h/6h/24h), drag the scrubber to any moment, or hit **▶ Timelapse**.
+  Images are kept 24h (`TIMELINE_HOURS`); telemetry too
   (`TIMELINE_RETENTION_HOURS`). Auto-pruned.
+- **Save anything from the window.** Scrub, mark **⟦ In** / **Out ⟧**, hit
+  **💾 Save clip** — the server copies that range out of the rolling window
+  into a permanent clip event (pure Blob copy, no transcode). Saved clips play
+  in the event feed forever.
+- **Sound alerts (the Sense's mic, unlocked).** The onboard PDM mic streams a
+  live sound-level chart, and a loud noise (bang, glass, door slam) records a
+  clip session exactly like motion — filed as a 🔊 sound event with its own
+  push voice. Sound events always record; the push is armed-gated by default.
+- **One-POST alarm pipeline for nodes.** Any lab node can fire
+  `POST /api/device/event` (`lab::event()` in firmware) — laser tripwire, reed
+  door contact, mmWave presence, panic button — and it lands in the event feed
+  + pushes to your phone with the camera's latest frame attached. Full wiring
+  + sketches for every node: [`docs/EXPANSION-PLAYBOOK.md`](docs/EXPANSION-PLAYBOOK.md).
+- **🎬 BTS mode.** One button flips the suite from security to content rig:
+  motion/sound alerts fully suppressed (models moving is the point), timeline
+  keeps rolling at full res as b-roll, **⏺ Capture** grabs a silent full-res
+  burst on demand, and the 🎬 pill makes shoot mode visible to everyone on set.
+  Scrub → save-clip → post.
+- **Studio lights (Govee).** The dashboard controls the light strips — on/off,
+  brightness, SAVAGE color swatches (set `GOVEE_API_KEY`). Security tie-in: a
+  panic event slams every strip full-bright red (`GOVEE_ALERT_KINDS`).
 - **Rotate from anywhere.** The **Rotate** button sets an `orient` flag (0/180);
   the camera reads it on its next poll and flips (persisted to NVS) — no reflash,
   no cable.
@@ -65,7 +87,7 @@ anywhere.
 
 | Device | Role | Key specs | Firmware |
 | --- | --- | --- | --- |
-| **Seeed XIAO ESP32S3 Sense** | the camera — device #1 (`roomcam`) | ESP32-S3 · 8 MB PSRAM · OV2640 2 MP (max UXGA 1600×1200) · microSD · 2.4 GHz Wi-Fi | `firmware/lab-cam/` |
+| **Seeed XIAO ESP32S3 Sense** | the camera — device #1 (`roomcam`) | ESP32-S3 · 8 MB PSRAM · OV2640 2 MP (max UXGA 1600×1200) · PDM mic (sound alerts) · microSD · 2.4 GHz Wi-Fi | `firmware/lab-cam/` |
 | **LilyGo T-Embed CC1101** | sub-GHz **RF** sensor node (not a camera) | ESP32-S3 + CC1101 radio + display; charts the ambient RF noise floor | `firmware/lillygo-tembed-cc1101/` |
 | **Any ESP32** | drop-in sensor node | your choice of sensors | `firmware/lab-node/` |
 
@@ -118,7 +140,7 @@ ntfy + microSD exactly as when armed by hand.
 | `device_state` | per-device flags: `arm`, `liveUntil`, `testAt`, `orient` (0/180) |
 | `frames` | frame **index**: device, kind (`live`/`timeline`/`motion`/`pinned`), timestamp, `blobPath`, w/h, meta |
 | `telemetry` | sensor readings: device, timestamp, metrics JSON |
-| `motion_events` | motion bursts: id, device, timestamp, frame paths, disposition |
+| `motion_events` | ALL events: id, device, timestamp, **kind** (motion/sound/clip/trip/door/panic/…), **label**, frame paths (empty for sensor pings), disposition |
 | `pins` | permanent saves: label, kind, `blobPath`, timestamp |
 | `commands` | generalized command queue — groundwork for actuator nodes (alarm/greet/shades/scene); not yet wired |
 
@@ -126,9 +148,9 @@ ntfy + microSD exactly as when armed by hand.
 
 | Prefix | What | Retention |
 | --- | --- | --- |
-| `timeline/<device>/<ms>.jpg` | 1s scrubbable snapshots | ~3h (`TIMELINE_HOURS`) |
+| `timeline/<device>/<ms>.jpg` | scrubbable snapshots | 24h (`TIMELINE_HOURS`) |
 | `pinned/<ms>_<meta>.jpg` | permanent saves | forever |
-| `motion/<event>/<seq>.jpg` | motion bursts | until you delete |
+| `motion/<event>/<seq>.jpg` | motion/sound bursts + saved clips (`clip…` ids) | until you delete |
 | `live/<ms>_….jpg` | HTTP-fallback live frames | newest few |
 
 Retention is enforced opportunistically on device writes plus a daily Vercel
@@ -141,8 +163,11 @@ Device side (Bearer `DEVICE_TOKEN`):
 - `POST /api/device/frame?kind=timeline|live|motion&device=<id>` — JPEG body
 - `POST /api/device/telemetry` — `{device, metrics:{…}, meta?:{…}}`
 - `POST /api/device/register` — `{device, name, type, caps[], firmware}`
-- `GET|POST /api/device/poll` — read arm/live/test/`orient`; POST syncs a
-  wall-button arm/disarm back up
+- `POST /api/device/event` — `{device, kind, label?, notify?}` — the alarm
+  pipeline: files an event + pushes to every phone with the camera's latest
+  frame attached (kinds: trip/door/panic/sound/presence/custom)
+- `GET|POST /api/device/poll` — read arm/live/test/`orient`/`tl` (timeline
+  cadence); POST syncs a wall-button arm/disarm back up
 - `wss /api/stream/ingest?token=<DEVICE_TOKEN>&device=<id>` — binary live frames
 
 Viewer side (session cookie from `POST /api/auth`):
@@ -150,7 +175,12 @@ Viewer side (session cookie from `POST /api/auth`):
 - `GET /api/view/status | timeline | telemetry | devices | events | pinned`
 - `GET /api/view/frame?path=` — signed CDN redirect
 - `POST /api/view/pin` · `DELETE /api/view/pinned?path=` · `DELETE /api/view/events?id=`
-- `POST /api/view/flags` — arm / go-live / stop-live / test / rotate (`orient`)
+- `POST /api/view/clip` — `{device, fromMs, toMs, label?}` — copy a timeline
+  range (≤10 min) into a permanent clip event
+- `GET|POST /api/view/lights` — list / control the Govee strips
+  (`{device, sku, action: power|brightness|color|ct, value}`)
+- `POST /api/view/flags` — arm / go-live / stop-live / test / rotate
+  (`orient`) / timeline cadence (`tlSec`) / 🎬 `bts` / 🎬 `capture`
 - `wss /api/stream/watch?device=<id>` — receive live frames
 - `POST /api/auth` (log in) · `DELETE /api/auth` (log out)
 
@@ -197,11 +227,13 @@ Optional:
 
 | Var | Default | What |
 | --- | --- | --- |
-| `TIMELINE_HOURS` | 3 | how long the 1s image timeline is kept |
+| `TIMELINE_HOURS` | 24 | how long the snapshot timeline is kept (the scrub window) |
 | `TIMELINE_RETENTION_HOURS` | 24 | how long telemetry is kept |
 | `CRON_SECRET` | — | Bearer auth for the prune cron |
 | `NEXT_PUBLIC_SITE_URL` | — | absolute URLs for OpenGraph |
 | `GEOFENCE_KEY` | — | shared secret for the iPhone auto-arm hook (`/api/geofence`) |
+| `GOVEE_API_KEY` | — | Govee Developer key — unlocks the Studio lights section |
+| `GOVEE_ALERT_KINDS` | `panic` | event kinds that flash the strips full-bright red |
 
 ## Adding a new gadget (the fun part)
 

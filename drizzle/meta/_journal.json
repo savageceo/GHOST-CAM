@@ -15,6 +15,20 @@
       "when": 1783278802756,
       "tag": "0001_frames_index",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1786444072394,
+      "tag": "0002_events_and_cadence",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1786448441475,
+      "tag": "0003_bts_mode",
+      "breakpoints": true
     }
   ]
 }

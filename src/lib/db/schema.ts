@@ -27,13 +27,21 @@ export const devices = pgTable("devices", {
 });
 
 // One row per device. Fast-path flags the camera polls for (arm/live/test) plus
-// orientation (0|180) — the server side of the cloud "Rotate" control.
+// orientation (0|180) — the server side of the cloud "Rotate" control — and
+// tlSec, the dashboard-set timeline cadence (0 = use the firmware's compiled
+// TIMELINE_SECONDS; 1-10 = override, no reflash).
+// bts = Behind-The-Scenes shoot mode: motion/sound alerts fully suppressed,
+// timeline keeps rolling as content. captureAt = on-demand 🎬 capture-burst
+// request (same edge-trigger pattern as testAt, but silent + kind "bts").
 export const deviceState = pgTable("device_state", {
   deviceId: text("device_id").primaryKey(),
   arm: boolean("arm").notNull().default(true),
   liveUntil: bigint("live_until", { mode: "number" }).notNull().default(0),
   testAt: bigint("test_at", { mode: "number" }).notNull().default(0),
   orient: integer("orient").notNull().default(180), // degrees: 0 or 180
+  tlSec: integer("tl_sec").notNull().default(0), // timeline cadence override (s)
+  bts: boolean("bts").notNull().default(false), // 🎬 shoot mode
+  captureAt: bigint("capture_at", { mode: "number" }).notNull().default(0),
   updatedAt: timestamp("updated_at", { withTimezone: true })
     .notNull()
     .defaultNow(),
@@ -88,12 +96,18 @@ export const telemetry = pgTable(
   (t) => [index("telemetry_device_at_idx").on(t.deviceId, t.at)],
 );
 
+// Events of every kind live here — camera bursts and sensor pings alike.
+// kind: motion | sound | clip (saved-from-timeline) | trip | door | panic | …
+// Sensor-node events have no frames (framePaths []); `label` is free text
+// shown on the event card ("entry beam", "saved 14:02–14:03").
 export const motionEvents = pgTable(
   "motion_events",
   {
     id: text("id").primaryKey(),
     deviceId: text("device_id").notNull(),
     at: timestamp("at", { withTimezone: true }).notNull(),
+    kind: text("kind").notNull().default("motion"),
+    label: text("label"),
     framePaths: jsonb("frame_paths").$type<string[]>().notNull().default([]),
     personId: bigint("person_id", { mode: "number" }), // Phase 2
     disposition: text("disposition"), // recorded | ignored | alerted

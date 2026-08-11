@@ -95,6 +95,31 @@ export function timelinePath(deviceId: string, ms: number): string {
 
 export type TimelinePoint = { path: string; at: number };
 
+// Every frame in [fromMs, toMs], oldest→newest, NOT decimated — the
+// save-from-timeline exporter needs the true sequence. Hard-capped.
+export async function listTimelineRange(
+  deviceId: string,
+  fromMs: number,
+  toMs: number,
+  cap = 300,
+): Promise<TimelinePoint[]> {
+  const db = getDb();
+  const rows = await db
+    .select({ path: schema.frames.blobPath, at: schema.frames.at })
+    .from(schema.frames)
+    .where(
+      and(
+        eq(schema.frames.deviceId, deviceId),
+        eq(schema.frames.kind, "timeline"),
+        gte(schema.frames.at, new Date(fromMs)),
+        lt(schema.frames.at, new Date(toMs + 1)),
+      ),
+    )
+    .orderBy(schema.frames.at)
+    .limit(cap);
+  return rows.map((r) => ({ path: r.path, at: r.at.getTime() }));
+}
+
 export async function listTimeline(
   deviceId: string,
   sinceMs: number,
@@ -134,25 +159,31 @@ async function pruneFramesOlderThan(
       ),
     );
   if (!stale.length) return 0;
-  try {
-    await del(stale.map((r) => r.blobPath));
-  } catch {}
-  await db.delete(schema.frames).where(
-    inArray(
-      schema.frames.id,
-      stale.map((r) => r.id),
-    ),
-  );
+  // Chunked: a 24h window can accumulate tens of thousands of stale rows after
+  // downtime or a retention change — one giant del()/inArray would choke.
+  for (let i = 0; i < stale.length; i += 400) {
+    const batch = stale.slice(i, i + 400);
+    try {
+      await del(batch.map((r) => r.blobPath));
+    } catch {}
+    await db.delete(schema.frames).where(
+      inArray(
+        schema.frames.id,
+        batch.map((r) => r.id),
+      ),
+    );
+  }
   return stale.length;
 }
 
-// The 1s-cadence timeline is dense, so keep it for TIMELINE_HOURS (default 3h):
-// enough margin for the last-hour scrubber without unbounded storage growth.
-// (Telemetry keeps the longer retentionMs() window.)
-const TIMELINE_HOURS = Number(process.env.TIMELINE_HOURS ?? "3");
+// The dense snapshot timeline is kept for TIMELINE_HOURS — default 24h, the
+// full scrubbable window. Anything worth keeping longer gets saved out of the
+// window as a clip (💾) or a pin, both permanent.
+// (Telemetry keeps the retentionMs() window.)
+const TIMELINE_HOURS = Number(process.env.TIMELINE_HOURS ?? "24");
 export async function pruneTimeline(deviceId: string): Promise<number> {
   const hours =
-    Number.isFinite(TIMELINE_HOURS) && TIMELINE_HOURS > 0 ? TIMELINE_HOURS : 3;
+    Number.isFinite(TIMELINE_HOURS) && TIMELINE_HOURS > 0 ? TIMELINE_HOURS : 24;
   return pruneFramesOlderThan(deviceId, "timeline", Date.now() - hours * HOUR_MS);
 }
 

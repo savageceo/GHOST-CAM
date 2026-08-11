@@ -35,17 +35,27 @@ export function checkDeviceAuth(request: Request): boolean {
 // arm/live/test are the camera's fast-path flags; `orient` (0|180) is the
 // server side of the cloud "Rotate" control. Default 0 = no sensor flip,
 // matching the firmware's compiled default (CAM_VFLIP/CAM_HMIRROR).
+// `tlSec` is the dashboard-set timeline cadence: 0 = firmware default
+// (TIMELINE_SECONDS in config.h), 1-10 = seconds between snapshots.
+// `bts` = 🎬 shoot mode (alerts suppressed, timeline = content);
+// `captureAt` = on-demand capture-burst edge trigger (like testAt, silent).
 export type Flags = {
   arm: boolean;
   liveUntil: number;
   testAt: number;
   orient: number;
+  tlSec: number;
+  bts: boolean;
+  captureAt: number;
 };
 export const DEFAULT_FLAGS: Flags = {
   arm: true,
   liveUntil: 0,
   testAt: 0,
   orient: 0,
+  tlSec: 0,
+  bts: false,
+  captureAt: 0,
 };
 
 export async function readFlags(
@@ -63,6 +73,9 @@ export async function readFlags(
     liveUntil: Number(row.liveUntil),
     testAt: Number(row.testAt),
     orient: row.orient,
+    tlSec: row.tlSec,
+    bts: row.bts,
+    captureAt: Number(row.captureAt),
   };
 }
 
@@ -76,6 +89,9 @@ export async function writeFlags(
     liveUntil: next.liveUntil,
     testAt: next.testAt,
     orient: next.orient,
+    tlSec: next.tlSec,
+    bts: next.bts,
+    captureAt: next.captureAt,
     updatedAt: new Date(),
   };
   await db
@@ -83,6 +99,20 @@ export async function writeFlags(
     .values({ deviceId, ...set })
     .onConflictDoUpdate({ target: schema.deviceState.deviceId, set });
   return next;
+}
+
+// Shared shape of the device-facing flag echo (poll/frame/telemetry/register
+// responses). `tl` is the timeline cadence override the camera should adopt.
+export function deviceFlagView(flags: Flags) {
+  return {
+    arm: flags.arm,
+    live: flags.liveUntil > Date.now(),
+    testAt: flags.testAt,
+    orient: flags.orient,
+    tl: flags.tlSec,
+    bts: flags.bts,
+    captureAt: flags.captureAt,
+  };
 }
 
 // ── frame paths (bytes live in Blob) ───────────────────────────────────────
@@ -141,8 +171,22 @@ export async function signedUrlFor(pathname: string): Promise<string> {
   return presignedUrl;
 }
 
-// ── motion events (motion_events table + Blob bytes) ────────────────────────
-export type MotionEvent = { id: string; at: number; frames: string[] };
+// ── events (motion_events table + Blob bytes) ───────────────────────────────
+// One table for every event kind: camera bursts (motion/sound — frames), clips
+// saved from the timeline (clip — frames), and sensor pings (trip/door/panic/…
+// — no frames, just a kind + label).
+export type MotionEvent = {
+  id: string;
+  at: number;
+  kind: string;
+  label: string | null;
+  device: string;
+  frames: string[];
+};
+
+export function validEventKind(kind: string): boolean {
+  return /^[a-z][a-z0-9_-]{0,15}$/.test(kind);
+}
 
 // Each burst frame POSTs separately; upsert appends its blob path to the event.
 export async function recordMotionFrame(
@@ -151,6 +195,7 @@ export async function recordMotionFrame(
   atMs: number,
   blobPath: string,
   seq: number,
+  kind = "motion",
 ): Promise<void> {
   const db = getDb();
   await db
@@ -159,6 +204,7 @@ export async function recordMotionFrame(
       id: eventId,
       deviceId,
       at: new Date(atMs),
+      kind,
       framePaths: [blobPath],
     })
     .onConflictDoUpdate({
@@ -173,6 +219,31 @@ export async function recordMotionFrame(
     });
 }
 
+// A frameless event from any lab node (laser trip, reed contact, panic button…)
+// — or a pre-built frame list (the save-from-timeline clip exporter).
+export async function recordEvent(
+  eventId: string,
+  deviceId: string,
+  atMs: number,
+  kind: string,
+  label?: string,
+  framePaths: string[] = [],
+): Promise<void> {
+  const db = getDb();
+  await db
+    .insert(schema.motionEvents)
+    .values({
+      id: eventId,
+      deviceId,
+      at: new Date(atMs),
+      kind,
+      label: label ?? null,
+      framePaths,
+      disposition: "alerted",
+    })
+    .onConflictDoNothing();
+}
+
 export async function listMotionEvents(cap: number): Promise<MotionEvent[]> {
   const db = getDb();
   const rows = await db
@@ -183,6 +254,9 @@ export async function listMotionEvents(cap: number): Promise<MotionEvent[]> {
   return rows.map((r) => ({
     id: r.id,
     at: r.at.getTime(),
+    kind: r.kind ?? "motion",
+    label: r.label ?? null,
+    device: r.deviceId,
     frames: [...(r.framePaths ?? [])].sort(),
   }));
 }

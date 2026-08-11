@@ -1,86 +1,107 @@
 #pragma once
 
-// ââ identity (this device in the SAVAGE LAB grid) âââââââââââââââââââââââââââ
+// ── identity (this device in the SAVAGE LAB grid) ───────────────────────────
 #define DEVICE_ID "roomcam"        // lowercase id, [a-z0-9_-], unique per node
 #define DEVICE_NAME "Room Cam"     // shown on the dashboard card
 #define DEVICE_TYPE "esp32-cam"    // free-form category label
-#define FIRMWARE_TAG "lab-cam-1"
+#define FIRMWARE_TAG "lab-cam-2"   // bumped: mic + 24h timeline + cloud cadence
 
-// ââ network âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// ── network ─────────────────────────────────────────────────────────────────
 #define WIFI_SSID "SAVAGE STUDIO"
 #define WIFI_PASS "<your-wifi-password>"
 // Optional fallback network. Leave SSID empty to skip.
 #define WIFI_SSID2 "N"
 #define WIFI_PASS2 "<fallback-wifi-password-or-empty>"
-// mDNS name â http://roomcam.local on the home network.
+// mDNS name — http://roomcam.local on the home network.
 #define HOSTNAME "roomcam"
 
-// ââ cloud (SAVAGE LAB / room-watch on Vercel) âââââââââââââââââââââââââââââââ
+// ── cloud (SAVAGE LAB / room-watch on Vercel) ───────────────────────────────
 #define API_HOST "room-watch-six.vercel.app"
 // Must match the DEVICE_TOKEN env var on the Vercel project.
-#define DEVICE_TOKEN "<hex24 â must match Vercel DEVICE_TOKEN env>"
+#define DEVICE_TOKEN "<hex24 — must match Vercel DEVICE_TOKEN env>"
 
-// ââ phone alerts (ntfy.sh, no account needed) âââââââââââââââââââââââââââââââ
-// Subscribe to this topic in the ntfy iPhone app. The name is the password â
+// ── phone alerts (ntfy.sh, no account needed) ───────────────────────────────
+// Subscribe to this topic in the ntfy iPhone app. The name is the password —
 // keep it private.
 #define NTFY_TOPIC "<your-private-ntfy-topic>"
 
-// ââ local viewing âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// ── local viewing ───────────────────────────────────────────────────────────
 // Key required on every local URL, so housemates on the WiFi can't watch:
 //   http://roomcam.local/?k=<STREAM_KEY>
-#define STREAM_KEY "<random hex â local viewing key>"
+#define STREAM_KEY "<random hex — local viewing key>"
 
-// ââ camera: still capture (timeline Â· motion Â· pins Â· LAN MJPEG) âââââââââââââ
-// UXGA 1600x1200 (1.92MP, native 4:3) is the OV2640's max â the sharpest the
-// sensor can do. Every *saved* frame (1s timeline, motion bursts, pins) uses
+// ── camera: still capture (timeline · motion · pins · LAN MJPEG) ────────────
+// UXGA 1600x1200 (1.92MP, native 4:3) is the OV2640's max — the sharpest the
+// sensor can do. Every *saved* frame (timeline, motion bursts, pins) uses
 // this. The live away-page stream uses a separate, faster size below, so you
 // keep max-detail stills AND a smooth live view at the same time.
 #define FRAME_SIZE FRAMESIZE_UXGA
-#define FRAME_W 1600  // still width  â also sizes the motion sampler (keep in sync)
+#define FRAME_W 1600  // still width  — also sizes the motion sampler (keep in sync)
 #define FRAME_H 1200  // still height
-// 10 (best) â¦ 63 (worst). 12 â crisp. If the camera fails to init at UXGA,
+// 10 (best) … 63 (worst). 12 → crisp. If the camera fails to init at UXGA,
 // nudge toward 14 (very low numbers enlarge the JPEG frame buffers in PSRAM).
 #define JPEG_QUALITY 12
 
-// ââ camera: live stream (the away-page WebSocket view) âââââââââââââââââââââââ
+// ── camera: live stream (the away-page WebSocket view) ──────────────────────
 // Live trades resolution for frame rate: the XIAO's 2.4GHz WiFi sustains only
-// ~2â4 Mbps of JPEG upload, so a smaller live frame = more fps. The sensor is
+// ~2–4 Mbps of JPEG upload, so a smaller live frame = more fps. The sensor is
 // switched to LIVE_FRAME_SIZE only while someone is watching, then back to UXGA
 // for stills. Rough live fps over solid WiFi (saved stills stay UXGA either way):
-//     VGA  640x480   ~20â30 fps      XGA  1024x768  ~8â12 fps
-//     SVGA 800x600   ~16â24 fps      HD   1280x720  ~10â14 fps   (default)
-//     UXGA 1600x1200 ~4â6 fps
+//     VGA  640x480   ~20–30 fps      XGA  1024x768  ~8–12 fps
+//     SVGA 800x600   ~16–24 fps      HD   1280x720  ~10–14 fps   (default)
+//     UXGA 1600x1200 ~4–6 fps
 // Set LIVE_DOWNSCALE 0 to stream at FRAME_SIZE (one resolution for everything).
 #define LIVE_DOWNSCALE 1              // 1 = fast live size below; 0 = live at FRAME_SIZE
 #define LIVE_FRAME_SIZE FRAMESIZE_HD  // live resolution (16:9, fills modern screens)
-#define LIVE_JPEG_QUALITY 11          // live JPEG quality (10 best â¦ 63 worst)
-// Minimum gap between live frames, ms. 0 = uncapped â stream as fast as WiFi
+#define LIVE_JPEG_QUALITY 11          // live JPEG quality (10 best … 63 worst)
+// Minimum gap between live frames, ms. 0 = uncapped — stream as fast as WiFi
 // drains (the WebSocket send back-pressures naturally, so it self-paces). Raise
-// to cap fps / save data: 66â15fps, 100â10fps, 150â6fps.
+// to cap fps / save data: 66≈15fps, 100≈10fps, 150≈6fps.
 #define LIVE_MIN_INTERVAL_MS 0
 
-// Camera orientation default: 1 = 180Â° flip (upside-down mount), 0 = no flip.
+// Camera orientation default: 1 = 180° flip (upside-down mount), 0 = no flip.
 // The cloud "Rotate"/orient flag and the local /flip page override this live and
 // persist to NVS, so this only sets a fresh flash's starting orientation.
 #define CAM_VFLIP 0
 #define CAM_HMIRROR 0
 
-// ââ behavior âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// ── behavior ────────────────────────────────────────────────────────────────
 // Armed = motion alerts on. Persisted across reboots once you toggle it.
 #define ARM_DEFAULT 1
 // How often to ask the cloud for arm/live/test flags when idle.
 #define POLL_SECONDS 8
 // One snapshot this often feeds the scrubbable timeline + is the heartbeat.
-// 1s = a smooth "1-second increments over the last hour" timelapse (the app
-// keeps ~3h then prunes). COST: 1s â 3600 Blob writes/hr (~86k/day). If that's
-// too much, raise to 2-5 (still a great timelapse) â it's just this one number.
+// The cloud now keeps a 24h window (TIMELINE_HOURS env), and the dashboard
+// cadence knob overrides this live (flag "tl") — so this is just the default.
+// COST at 24h retention: 1s ≈ 86k Blob writes/day · ~10-17 GB rolling;
+// 2s halves both. Pick 2 if you don't need second-perfect scrubbing.
 #define TIMELINE_SECONDS 1
-// Push chip temp / wifi / memory / uptime this often (feeds sensor charts).
+// Push chip temp / wifi / memory / uptime / sound this often (sensor charts).
 #define TELEMETRY_SECONDS 60
 
-// ââ motion detection âââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// ── microphone (Sense onboard PDM mic) ──────────────────────────────────────
+// The XIAO ESP32S3 Sense has a PDM mic on GPIO 41/42 — this wakes it up:
+//   · soundDb / soundPk stream to the dashboard sensor charts
+//   · a loud noise (bang, glass, door slam) triggers a clip session exactly
+//     like motion, filed as a "sound" event (🔊) with its own push voice
+// Policy: the mic is always on and sound events ALWAYS record, armed or not;
+// only the phone push is armed-gated (see SOUND_PUSH_WHEN_DISARMED).
+#define MIC_ENABLED 1
+// XIAO ESP32S3 Sense PDM pins (fixed by the board — don't change).
+#define MIC_CLK_PIN 42
+#define MIC_DATA_PIN 41
+// Trigger = louder than (ambient floor + SOUND_TRIGGER_DB) AND louder than
+// SOUND_MIN_DBFS absolute, sustained SOUND_MIN_MS. The floor self-adapts, so
+// TRIGGER_DB is the main knob: lower = more sensitive.
+#define SOUND_TRIGGER_DB 18.0f
+#define SOUND_MIN_DBFS -34.0f   // 0 dBFS = clipping; quiet room ≈ −55…−70
+#define SOUND_MIN_MS 120        // ignore clicks/pops shorter than this
+#define SOUND_COOLDOWN_S 45     // min gap between sound-triggered sessions
+#define SOUND_PUSH_WHEN_DISARMED 0  // 1 = loud-noise pushes even when disarmed
+
+// ── motion detection ────────────────────────────────────────────────────────
 // Motion sampler JPEG decode-scale divisor (8, 4, or 2). Frames are decoded to
-// grayscale by the JPEGDEC library â the core-3.x esp_jpeg/tjpgd decoder can't
+// grayscale by the JPEGDEC library — the core-3.x esp_jpeg/tjpgd decoder can't
 // read the OV2640's JPEGs at all (logs "Error in decoding JPEG image! 6"). 8 =
 // 1/8 (200x150 at UXGA), plenty for motion; smaller = finer but more CPU/PSRAM.
 #define MOTION_SCALE_DIV 8
@@ -89,7 +110,7 @@
 // A pixel "changed" when its brightness moves more than this (0-255). Lower =
 // more sensitive to subtle movement (and to sensor noise). Low for dim rooms.
 #define MOTION_PIXEL_DELTA 10
-// The frame is "motion" when at least this % of pixels changed â the main
+// The frame is "motion" when at least this % of pixels changed — the main
 // sensitivity knob. Lower to trigger on smaller / more distant movement.
 #define MOTION_TRIGGER_PCT 1.8
 // Samples in a row over the threshold before it fires. 1 = trigger on the first
@@ -101,9 +122,9 @@
 // Ignore motion this long after boot (auto-exposure settling).
 #define BOOT_GRACE_S 12
 
-// ââ motion clip recording ââââââââââââââââââââââââââââââââââââââââââââââââââââ
+// ── motion clip recording ───────────────────────────────────────────────────
 // On motion the camera records a CLIP_SECONDS clip at CLIP_FPS, sends ONE alert,
-// then watches RECHECK_SECONDS for more movement â if it continues it records
+// then watches RECHECK_SECONDS for more movement — if it continues it records
 // another clip, and so on, up to MAX_CLIPS (a safety cap per session). Each clip
 // becomes its own playable event in the dashboard.
 #define CLIP_SECONDS 15
@@ -111,16 +132,16 @@
 #define RECHECK_SECONDS 5
 #define MAX_CLIPS 8
 
-// ââ microSD archive (optional â works fine with no card) ââââââââââââââââââââ
+// ── microSD archive (optional — works fine with no card) ────────────────────
 #define SD_CS_PIN 21
 // Ring buffer: delete oldest events when free space drops below this.
 #define SD_MIN_FREE_MB 200
 // One-time reformat: set 1 to reformat the card to FAT32 when it won't mount
 // (fixes exFAT / 64GB+ cards the SD lib can't read), reflash, then set back to
-// 0. WIPES the card â leave at 0 in normal use so a glitch can't erase it.
+// 0. WIPES the card — leave at 0 in normal use so a glitch can't erase it.
 #define SD_FORMAT_ON_FAIL 0
 
-// ââ night mode (auto low-light) âââââââââââââââââââââââââââââââââââââââââââââ
+// ── night mode (auto low-light) ─────────────────────────────────────────────
 // Auto day/night: the motion sampler measures average scene brightness (0-255);
 // when it falls below NIGHT_ENTER_LUMA the sensor cranks gain/exposure for a
 // usable low-light picture, and restores daylight settings above NIGHT_EXIT_LUMA

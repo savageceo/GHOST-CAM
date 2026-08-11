@@ -3,6 +3,56 @@
 A running record of the state of this build and the non-obvious things that
 matter. Newest work at the top.
 
+## 2026-08-11 (later) — 🎬 BTS mode · Govee lights · expansion playbook
+
+Second pass the same day: the suite is now a **content rig too**, and the
+lights answer to the dashboard.
+
+- **BTS mode** (`device_state.bts`, migration 0003): 🎬 button suppresses
+  motion + sound alerts entirely while the timeline keeps rolling at full res;
+  **⏺ Capture** (`capture_at`) records a silent on-demand 15s burst, filed 🎬
+  in Events. Pill in the header + `bts` telemetry chip make shoot mode
+  visible. House rules + socials workflow: `docs/EXPANSION-PLAYBOOK.md` §10.
+- **Govee lights**: `GOVEE_API_KEY` env → Studio lights section (on/off,
+  brightness, SAVAGE swatches) via the Govee platform API; **panic events
+  slam the strips full-bright red** (`GOVEE_ALERT_KINDS`, default panic).
+- **`docs/EXPANSION-PLAYBOOK.md`** — wiring + flash-ready sketches for the
+  laser tripwire, VL53L1X invisible trip, reed door node, panic button, siren
+  (MOSFET), LD2410C presence, cams #2/#3, NFC tap-to-arm, print queue, and
+  the deploy checklist. This is the build manual for the incoming order.
+- Deploy delta on top of the morning pass: `npx drizzle-kit migrate` picks up
+  0003 automatically; add `GOVEE_API_KEY` (+optional `GOVEE_ALERT_KINDS`) to
+  Vercel; redeploy; reflash (same command). Verified: next build clean, tsc
+  clean, XIAO_ESP32S3 compile clean (37% flash).
+
+## 2026-08-11 — mic unlocked · 24h timeline · save-from-window · alarm pipeline
+
+The Sense's last dark corner (the PDM mic) is now live, the timeline is a full
+day deep, anything in it can be saved out permanently, and any future node
+(tripwire / door / panic) alerts the phone with ONE call. Deploy order:
+
+1. **DB migration** (adds `device_state.tl_sec`, `motion_events.kind/label`):
+   `npx drizzle-kit migrate` (or `npx drizzle-kit push`). Idempotent.
+2. **Env**: delete/raise any `TIMELINE_HOURS=3` override in Vercel — the code
+   default is now **24**. (Blob cost at 24h·1s ≈ 86k writes/day, ~10-17 GB
+   rolling; the dashboard cadence knob → 2s halves it. Watch the first bill.)
+3. **Deploy**: `vercel deploy --prod --yes`. Dashboard gains: window picker
+   (1h/3h/6h/24h), ⟦ In / Out ⟧ + 💾 Save clip, cadence knob (footer), sound
+   charts, kind-tagged event feed.
+4. **Reflash the camera** (same build command as always). New config knobs are
+   optional — an untouched config.h compiles (defaults live in the .ino);
+   copy the mic block from `config.h.example` when you want to tune. Serial
+   now narrates `[mic] level/floor/peak` + `[mic] TRIGGER`.
+5. **Verify**: `[mic] PDM mic on` at boot · Sound level chart moving · clap
+   hard → 🔊 push with photo · scrub, mark In/Out, Save clip → plays in feed.
+
+Decisions that live here: mic policy is **always-on, always-record; push
+armed-gated** (`SOUND_PUSH_WHEN_DISARMED` flips that). Sound clips ride the
+motion session machinery (`&type=sound` on the frame POST) — one pipeline, two
+triggers. Node alarms: `POST /api/device/event` / `lab::event()` — the push
+attaches the camera's newest frame so every alert arrives with a look at the
+room.
+
 ## Where things stand
 
 - **Live streaming: fixed and working (~5 fps @ HD).** It was silently stuck at

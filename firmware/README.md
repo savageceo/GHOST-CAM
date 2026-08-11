@@ -8,9 +8,11 @@ dashboard grid automatically.
 
 **The hardware.** A **Seeed Studio XIAO ESP32S3 Sense**: an ESP32-S3 (dual-core
 240 MHz) with **8 MB PSRAM**, an **OV2640** 2 MP camera (max UXGA 1600×1200,
-native 4:3), a microSD slot, and **2.4 GHz-only** Wi-Fi on a single onboard
-antenna. The PSRAM is what makes full-res JPEG capture possible; the 2.4 GHz
-radio is the ceiling on live frame rate (see the table below).
+native 4:3), an onboard **PDM microphone** (GPIO 41/42), a microSD slot, and
+**2.4 GHz-only** Wi-Fi on a single onboard antenna. The PSRAM is what makes
+full-res JPEG capture possible; the 2.4 GHz radio is the ceiling on live frame
+rate (see the table below). With the mic unlocked, every sensor on the board
+is now in use.
 
 Everything the old `room-cam` did, plus:
 
@@ -25,6 +27,19 @@ Everything the old `room-cam` did, plus:
   uptime, SD + armed state → live charts,
 - **cloud rotate**: the dashboard's Rotate button flips the image (0/180) on the
   next poll, persisted to NVS — no reflash,
+- **the MIC, unlocked**: continuous sound-level metering (`soundDb`/`soundPk`
+  charts) + a loud-noise trigger that records a clip session exactly like
+  motion, filed as a 🔊 "sound" event. Detection is adaptive (floor-tracking
+  EMA), so it triggers on *bang above ambient*, not absolute volume alone.
+  Sound events ALWAYS record; the phone push is armed-gated unless
+  `SOUND_PUSH_WHEN_DISARMED 1`. Knobs: `SOUND_TRIGGER_DB` (main sensitivity),
+  `SOUND_MIN_DBFS`, `SOUND_MIN_MS`, `SOUND_COOLDOWN_S`, `MIC_ENABLED 0` kills
+  it entirely,
+- **cloud cadence knob**: the dashboard's snapshot-cadence control ("auto/1s/
+  2s/5s/10s") overrides `TIMELINE_SECONDS` live via the `tl` flag — no reflash,
+- **🎬 BTS mode** (`bts` flag): motion + sound triggers fully suppressed while
+  the timeline keeps rolling — the shoot IS the content. **⏺ Capture**
+  (`captureAt` flag) records one silent full-res clip on demand, filed 🎬,
 - **self-registration** into the device grid on boot.
 
 ### Build & flash
@@ -114,6 +129,13 @@ To make a new node: copy the `lab-node/` folder, edit the CONFIG block
 (`DEVICE_ID`, `DEVICE_NAME`, WiFi, and the same `DEVICE_TOKEN`), fill
 `readSensors()`, flash. Numeric metrics become charts; bools/strings show as
 status chips.
+
+**Alarms:** `lab::event(id, kind, label)` is the one-liner that pings the
+phone — it files an event and the cloud pushes it with the camera's latest
+frame attached. Kinds with their own push voice: `trip` (laser beam), `door`
+(reed contact + magnet), `panic` (the button), `sound`, `presence` (mmWave).
+That's the whole integration for a tripwire or panic button: one `if`, one
+call (see the commented examples in `lab-node.ino`).
 
 ## `lillygo-tembed-cc1101/` — sub-GHz RF node example
 
